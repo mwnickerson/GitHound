@@ -562,9 +562,11 @@ function Write-GitHoundPayload {
         [int]$Tier,
 
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [System.Collections.ArrayList]$Nodes,
 
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [System.Collections.ArrayList]$Edges
     )
 
