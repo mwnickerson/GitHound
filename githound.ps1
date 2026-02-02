@@ -598,6 +598,64 @@ function Write-GitHoundPayload {
     return $filepath
 }
 
+function Save-GitHoundCheckpoint {
+    <#
+    .SYNOPSIS
+        Saves a checkpoint file to track collection progress for resume functionality.
+
+    .PARAMETER OutputFolder
+        The output folder where the checkpoint file will be saved.
+
+    .PARAMETER Checkpoint
+        A hashtable containing checkpoint data (completedPhases, parameters, etc.).
+    #>
+    Param(
+        [Parameter(Mandatory = $true)]
+        [string]$OutputFolder,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Checkpoint
+    )
+
+    $checkpointPath = Join-Path -Path $OutputFolder -ChildPath "_checkpoint.json"
+    $Checkpoint | ConvertTo-Json -Depth 5 | Out-File -FilePath $checkpointPath -Force
+}
+
+function Get-GitHoundCheckpoint {
+    <#
+    .SYNOPSIS
+        Loads a checkpoint file from a previous run.
+
+    .PARAMETER OutputFolder
+        The output folder containing the checkpoint file.
+
+    .OUTPUTS
+        Returns the checkpoint hashtable, or $null if no checkpoint exists.
+    #>
+    Param(
+        [Parameter(Mandatory = $true)]
+        [string]$OutputFolder
+    )
+
+    $checkpointPath = Join-Path -Path $OutputFolder -ChildPath "_checkpoint.json"
+    if (Test-Path $checkpointPath) {
+        $checkpoint = Get-Content -Path $checkpointPath -Raw | ConvertFrom-Json
+        # Convert PSCustomObject to hashtable
+        $result = @{
+            timestamp = $checkpoint.timestamp
+            orgId = $checkpoint.orgId
+            completedPhases = @($checkpoint.completedPhases)
+            collect = @($checkpoint.collect)
+            userLimit = $checkpoint.userLimit
+            repoFilter = $checkpoint.repoFilter
+            repoVisibility = $checkpoint.repoVisibility
+            throttleLimit = $checkpoint.throttleLimit
+        }
+        return $result
+    }
+    return $null
+}
+
 function Git-HoundOrganization
 {
     <#
@@ -2758,6 +2816,10 @@ function Invoke-GitHound
     .PARAMETER Zip
         If specified, compresses all output files into a zip archive and removes the output folder.
 
+    .PARAMETER Resume
+        Path to an existing output folder from a previous run to resume collection.
+        Completed phases will be skipped and collection continues from where it left off.
+
     .EXAMPLE
         $session = New-GithubSession -OrganizationName "my-org" -Token $token
         Invoke-GitHound -Session $session
@@ -2770,6 +2832,10 @@ function Invoke-GitHound
 
     .EXAMPLE
         Invoke-GitHound -Session $session -Zip
+
+    .EXAMPLE
+        # Resume a previous run that was interrupted
+        Invoke-GitHound -Session $session -Resume './20240202180743_O_kgDOCoV2OQ/'
     #>
     [CmdletBinding()]
     Param(
@@ -2800,14 +2866,48 @@ function Invoke-GitHound
         [int]$ThrottleLimit = 25,
 
         [Parameter(Mandatory = $false)]
-        [switch]$Zip
+        [switch]$Zip,
+
+        [Parameter(Mandatory = $false)]
+        [string]$Resume = ''
     )
 
-    # Resolve 'All' to explicit phases
-    if ($Collect -contains 'All') {
-        $Collect = @('Users', 'Teams', 'Repos', 'Branches', 'Workflows',
-                     'Environments', 'Secrets', 'TeamRoles', 'OrgRoles',
-                     'RepoRoles', 'SecretScanning', 'AppInstallations', 'SAML')
+    # Track completed phases for checkpoint/resume
+    $completedPhases = @()
+
+    # Handle resume from previous run
+    if ($Resume -ne '') {
+        if (-not (Test-Path $Resume)) {
+            throw "Resume folder not found: $Resume"
+        }
+
+        $checkpoint = Get-GitHoundCheckpoint -OutputFolder $Resume
+        if ($null -eq $checkpoint) {
+            throw "No checkpoint file found in: $Resume"
+        }
+
+        Write-Host "[*] Resuming from checkpoint in: $Resume"
+        Write-Host "[*] Previously completed phases: $($checkpoint.completedPhases -join ', ')"
+
+        # Restore parameters from checkpoint
+        $timestamp = $checkpoint.timestamp
+        $orgId = $checkpoint.orgId
+        $outputFolder = $Resume
+        $Collect = $checkpoint.collect
+        $UserLimit = $checkpoint.userLimit
+        $RepoFilter = $checkpoint.repoFilter
+        $RepoVisibility = $checkpoint.repoVisibility
+        $ThrottleLimit = $checkpoint.throttleLimit
+        $completedPhases = @($checkpoint.completedPhases)
+
+        # Skip the 'All' resolution since we restored the explicit phases
+    } else {
+        # Resolve 'All' to explicit phases
+        if ($Collect -contains 'All') {
+            $Collect = @('Users', 'Teams', 'Repos', 'Branches', 'Workflows',
+                         'Environments', 'Secrets', 'TeamRoles', 'OrgRoles',
+                         'RepoRoles', 'SecretScanning', 'AppInstallations', 'SAML')
+        }
     }
 
     # Auto-include Repos if any repo-dependent phase is selected
@@ -2822,27 +2922,6 @@ function Invoke-GitHound
 
     $Global:GitHoundFunctionBundle = Get-GitHoundFunctionBundle
 
-    # ===========================================
-    # Organization Phase (ALWAYS runs - Tier 1)
-    # ===========================================
-    Write-Host "[*] Starting GitHound for $($Session.OrganizationName)"
-    $org = Git-HoundOrganization -Session $Session
-
-    # Generate timestamp and create output folder using org node_id
-    $timestamp = Get-Date -Format "yyyyMMddHHmmss"
-    $orgId = $org.nodes[0].id
-    $folderName = "${timestamp}_${orgId}"
-    $outputFolder = Join-Path -Path $OutputPath -ChildPath $folderName
-
-    # Ensure base output directory exists
-    if (-not (Test-Path $OutputPath)) {
-        New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
-    }
-
-    # Create timestamped output folder for this run
-    New-Item -ItemType Directory -Path $outputFolder -Force | Out-Null
-    Write-Host "[*] Output folder: $outputFolder"
-
     # Track written files for ingestion order summary
     $writtenFiles = New-Object System.Collections.ArrayList
 
@@ -2850,14 +2929,68 @@ function Invoke-GitHound
     $allNodes = New-Object System.Collections.ArrayList
     $allEdges = New-Object System.Collections.ArrayList
 
-    $orgNodes = New-Object System.Collections.ArrayList
-    $orgEdges = New-Object System.Collections.ArrayList
-    if ($org.nodes) { $null = $orgNodes.AddRange(@($org.nodes)) }
-    if ($org.edges) { $null = $orgEdges.AddRange(@($org.edges)) }
+    # ===========================================
+    # Organization Phase (ALWAYS runs - Tier 1)
+    # ===========================================
+    Write-Host "[*] Starting GitHound for $($Session.OrganizationName)"
+    $org = Git-HoundOrganization -Session $Session
 
-    $orgFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
-        -PhaseName 'organization' -Tier 1 -Nodes $orgNodes -Edges $orgEdges
-    $null = $writtenFiles.Add(@{ File = $orgFile; Tier = 1; Phase = 'organization' })
+    # Setup output folder (new run or resume)
+    if ($Resume -eq '') {
+        # New run - generate timestamp and create output folder
+        $timestamp = Get-Date -Format "yyyyMMddHHmmss"
+        $orgId = $org.nodes[0].id
+        $folderName = "${timestamp}_${orgId}"
+        $outputFolder = Join-Path -Path $OutputPath -ChildPath $folderName
+
+        # Ensure base output directory exists
+        if (-not (Test-Path $OutputPath)) {
+            New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
+        }
+
+        # Create timestamped output folder for this run
+        New-Item -ItemType Directory -Path $outputFolder -Force | Out-Null
+        Write-Host "[*] Output folder: $outputFolder"
+    } else {
+        # Resuming - use existing folder, get orgId from collected data
+        $orgId = $org.nodes[0].id
+        Write-Host "[*] Resuming in folder: $outputFolder"
+    }
+
+    # Helper function to save checkpoint
+    function Save-Checkpoint {
+        $checkpointData = @{
+            timestamp = $timestamp
+            orgId = $orgId
+            completedPhases = $completedPhases
+            collect = $Collect
+            userLimit = $UserLimit
+            repoFilter = $RepoFilter
+            repoVisibility = $RepoVisibility
+            throttleLimit = $ThrottleLimit
+        }
+        Save-GitHoundCheckpoint -OutputFolder $outputFolder -Checkpoint $checkpointData
+    }
+
+    # Write organization phase if not already completed
+    if ($completedPhases -notcontains 'organization') {
+        $orgNodes = New-Object System.Collections.ArrayList
+        $orgEdges = New-Object System.Collections.ArrayList
+        if ($org.nodes) { $null = $orgNodes.AddRange(@($org.nodes)) }
+        if ($org.edges) { $null = $orgEdges.AddRange(@($org.edges)) }
+
+        $orgFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
+            -PhaseName 'organization' -Tier 1 -Nodes $orgNodes -Edges $orgEdges
+        $null = $writtenFiles.Add(@{ File = $orgFile; Tier = 1; Phase = 'organization' })
+
+        $completedPhases += 'organization'
+        Save-Checkpoint
+    } else {
+        Write-Host "[*] Skipping organization phase (already completed)"
+        # Still need to track the file for summary
+        $orgFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_organization.json"
+        $null = $writtenFiles.Add(@{ File = $orgFile; Tier = 1; Phase = 'organization' })
+    }
 
     if ($org.nodes) { $null = $allNodes.AddRange(@($org.nodes)) }
     if ($org.edges) { $null = $allEdges.AddRange(@($org.edges)) }
@@ -2866,45 +2999,65 @@ function Invoke-GitHound
     # Users Phase (Tier 1)
     # ===========================================
     if ($Collect -contains 'Users') {
-        Write-Host "[*] Enumerating Organization Users"
-        $users = $org.nodes[0] | Git-HoundUser -Session $Session -Limit $UserLimit -ThrottleLimit $ThrottleLimit
+        if ($completedPhases -notcontains 'users') {
+            Write-Host "[*] Enumerating Organization Users"
+            $users = $org.nodes[0] | Git-HoundUser -Session $Session -Limit $UserLimit -ThrottleLimit $ThrottleLimit
 
-        $userNodes = New-Object System.Collections.ArrayList
-        $userEdges = New-Object System.Collections.ArrayList
-        if ($users) { $null = $userNodes.AddRange(@($users)) }
+            $userNodes = New-Object System.Collections.ArrayList
+            $userEdges = New-Object System.Collections.ArrayList
+            if ($users) { $null = $userNodes.AddRange(@($users)) }
 
-        $userFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
-            -PhaseName 'users' -Tier 1 -Nodes $userNodes -Edges $userEdges
-        $null = $writtenFiles.Add(@{ File = $userFile; Tier = 1; Phase = 'users' })
+            $userFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
+                -PhaseName 'users' -Tier 1 -Nodes $userNodes -Edges $userEdges
+            $null = $writtenFiles.Add(@{ File = $userFile; Tier = 1; Phase = 'users' })
 
-        if ($users) { $null = $allNodes.AddRange(@($users)) }
+            if ($users) { $null = $allNodes.AddRange(@($users)) }
+
+            $completedPhases += 'users'
+            Save-Checkpoint
+        } else {
+            Write-Host "[*] Skipping users phase (already completed)"
+            $userFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_users.json"
+            $null = $writtenFiles.Add(@{ File = $userFile; Tier = 1; Phase = 'users' })
+        }
     }
 
     # ===========================================
     # Teams Phase (Tier 1)
     # ===========================================
     if ($Collect -contains 'Teams') {
-        Write-Host "[*] Enumerating Organization Teams"
-        $teams = $org.nodes[0] | Git-HoundTeam -Session $Session
+        if ($completedPhases -notcontains 'teams') {
+            Write-Host "[*] Enumerating Organization Teams"
+            $teams = $org.nodes[0] | Git-HoundTeam -Session $Session
 
-        $teamNodes = New-Object System.Collections.ArrayList
-        $teamEdges = New-Object System.Collections.ArrayList
-        if ($teams.nodes) { $null = $teamNodes.AddRange(@($teams.nodes)) }
-        if ($teams.edges) { $null = $teamEdges.AddRange(@($teams.edges)) }
+            $teamNodes = New-Object System.Collections.ArrayList
+            $teamEdges = New-Object System.Collections.ArrayList
+            if ($teams.nodes) { $null = $teamNodes.AddRange(@($teams.nodes)) }
+            if ($teams.edges) { $null = $teamEdges.AddRange(@($teams.edges)) }
 
-        $teamFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
-            -PhaseName 'teams' -Tier 1 -Nodes $teamNodes -Edges $teamEdges
-        $null = $writtenFiles.Add(@{ File = $teamFile; Tier = 1; Phase = 'teams' })
+            $teamFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
+                -PhaseName 'teams' -Tier 1 -Nodes $teamNodes -Edges $teamEdges
+            $null = $writtenFiles.Add(@{ File = $teamFile; Tier = 1; Phase = 'teams' })
 
-        if ($teams.nodes) { $null = $allNodes.AddRange(@($teams.nodes)) }
-        if ($teams.edges) { $null = $allEdges.AddRange(@($teams.edges)) }
+            if ($teams.nodes) { $null = $allNodes.AddRange(@($teams.nodes)) }
+            if ($teams.edges) { $null = $allEdges.AddRange(@($teams.edges)) }
+
+            $completedPhases += 'teams'
+            Save-Checkpoint
+        } else {
+            Write-Host "[*] Skipping teams phase (already completed)"
+            $teamFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_teams.json"
+            $null = $writtenFiles.Add(@{ File = $teamFile; Tier = 1; Phase = 'teams' })
+        }
     }
 
     # ===========================================
     # Repos Phase (Tier 1)
     # ===========================================
+    # Note: Repos must always be collected if any repo-dependent phase needs to run
     $repos = $null
     if ($Collect -contains 'Repos') {
+        # Always collect repos data (needed for subsequent phases)
         Write-Host "[*] Enumerating Organization Repositories"
         $repos = $org.nodes[0] | Git-HoundRepository -Session $Session
 
@@ -2928,217 +3081,317 @@ function Invoke-GitHound
             $repos.edges = $repos.edges | Where-Object { $filteredRepoIds -contains $_.end.value }
         }
 
-        $repoNodes = New-Object System.Collections.ArrayList
-        $repoEdges = New-Object System.Collections.ArrayList
-        if ($repos.nodes) { $null = $repoNodes.AddRange(@($repos.nodes)) }
-        if ($repos.edges) { $null = $repoEdges.AddRange(@($repos.edges)) }
+        # Only write if not already completed
+        if ($completedPhases -notcontains 'repos') {
+            $repoNodes = New-Object System.Collections.ArrayList
+            $repoEdges = New-Object System.Collections.ArrayList
+            if ($repos.nodes) { $null = $repoNodes.AddRange(@($repos.nodes)) }
+            if ($repos.edges) { $null = $repoEdges.AddRange(@($repos.edges)) }
 
-        $repoFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
-            -PhaseName 'repos' -Tier 1 -Nodes $repoNodes -Edges $repoEdges
-        $null = $writtenFiles.Add(@{ File = $repoFile; Tier = 1; Phase = 'repos' })
+            $repoFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
+                -PhaseName 'repos' -Tier 1 -Nodes $repoNodes -Edges $repoEdges
+            $null = $writtenFiles.Add(@{ File = $repoFile; Tier = 1; Phase = 'repos' })
 
-        if ($repos.nodes) { $null = $allNodes.AddRange(@($repos.nodes)) }
-        if ($repos.edges) { $null = $allEdges.AddRange(@($repos.edges)) }
+            if ($repos.nodes) { $null = $allNodes.AddRange(@($repos.nodes)) }
+            if ($repos.edges) { $null = $allEdges.AddRange(@($repos.edges)) }
+
+            $completedPhases += 'repos'
+            Save-Checkpoint
+        } else {
+            Write-Host "[*] Skipping repos file write (already completed)"
+            $repoFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_repos.json"
+            $null = $writtenFiles.Add(@{ File = $repoFile; Tier = 1; Phase = 'repos' })
+        }
     }
 
     # ===========================================
     # Branches Phase (Tier 2)
     # ===========================================
     if ($Collect -contains 'Branches' -and $repos) {
-        Write-Host "[*] Enumerating Organization Branches"
-        $branches = $repos | Git-HoundBranch -Session $Session -ThrottleLimit $ThrottleLimit
+        if ($completedPhases -notcontains 'branches') {
+            Write-Host "[*] Enumerating Organization Branches"
+            $branches = $repos | Git-HoundBranch -Session $Session -ThrottleLimit $ThrottleLimit
 
-        $branchNodes = New-Object System.Collections.ArrayList
-        $branchEdges = New-Object System.Collections.ArrayList
-        if ($branches.nodes) { $null = $branchNodes.AddRange(@($branches.nodes)) }
-        if ($branches.edges) { $null = $branchEdges.AddRange(@($branches.edges)) }
+            $branchNodes = New-Object System.Collections.ArrayList
+            $branchEdges = New-Object System.Collections.ArrayList
+            if ($branches.nodes) { $null = $branchNodes.AddRange(@($branches.nodes)) }
+            if ($branches.edges) { $null = $branchEdges.AddRange(@($branches.edges)) }
 
-        $branchFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
-            -PhaseName 'branches' -Tier 2 -Nodes $branchNodes -Edges $branchEdges
-        $null = $writtenFiles.Add(@{ File = $branchFile; Tier = 2; Phase = 'branches' })
+            $branchFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
+                -PhaseName 'branches' -Tier 2 -Nodes $branchNodes -Edges $branchEdges
+            $null = $writtenFiles.Add(@{ File = $branchFile; Tier = 2; Phase = 'branches' })
 
-        if ($branches.nodes) { $null = $allNodes.AddRange(@($branches.nodes)) }
-        if ($branches.edges) { $null = $allEdges.AddRange(@($branches.edges)) }
+            if ($branches.nodes) { $null = $allNodes.AddRange(@($branches.nodes)) }
+            if ($branches.edges) { $null = $allEdges.AddRange(@($branches.edges)) }
+
+            $completedPhases += 'branches'
+            Save-Checkpoint
+        } else {
+            Write-Host "[*] Skipping branches phase (already completed)"
+            $branchFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_branches.json"
+            $null = $writtenFiles.Add(@{ File = $branchFile; Tier = 2; Phase = 'branches' })
+        }
     }
 
     # ===========================================
     # Workflows Phase (Tier 2)
     # ===========================================
     if ($Collect -contains 'Workflows' -and $repos) {
-        Write-Host "[*] Enumerating Organization Workflows"
-        $workflows = $repos | Git-HoundWorkflow -Session $Session -ThrottleLimit $ThrottleLimit
+        if ($completedPhases -notcontains 'workflows') {
+            Write-Host "[*] Enumerating Organization Workflows"
+            $workflows = $repos | Git-HoundWorkflow -Session $Session -ThrottleLimit $ThrottleLimit
 
-        $workflowNodes = New-Object System.Collections.ArrayList
-        $workflowEdges = New-Object System.Collections.ArrayList
-        if ($workflows.nodes) { $null = $workflowNodes.AddRange(@($workflows.nodes)) }
-        if ($workflows.edges) { $null = $workflowEdges.AddRange(@($workflows.edges)) }
+            $workflowNodes = New-Object System.Collections.ArrayList
+            $workflowEdges = New-Object System.Collections.ArrayList
+            if ($workflows.nodes) { $null = $workflowNodes.AddRange(@($workflows.nodes)) }
+            if ($workflows.edges) { $null = $workflowEdges.AddRange(@($workflows.edges)) }
 
-        $workflowFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
-            -PhaseName 'workflows' -Tier 2 -Nodes $workflowNodes -Edges $workflowEdges
-        $null = $writtenFiles.Add(@{ File = $workflowFile; Tier = 2; Phase = 'workflows' })
+            $workflowFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
+                -PhaseName 'workflows' -Tier 2 -Nodes $workflowNodes -Edges $workflowEdges
+            $null = $writtenFiles.Add(@{ File = $workflowFile; Tier = 2; Phase = 'workflows' })
 
-        if ($workflows.nodes) { $null = $allNodes.AddRange(@($workflows.nodes)) }
-        if ($workflows.edges) { $null = $allEdges.AddRange(@($workflows.edges)) }
+            if ($workflows.nodes) { $null = $allNodes.AddRange(@($workflows.nodes)) }
+            if ($workflows.edges) { $null = $allEdges.AddRange(@($workflows.edges)) }
+
+            $completedPhases += 'workflows'
+            Save-Checkpoint
+        } else {
+            Write-Host "[*] Skipping workflows phase (already completed)"
+            $workflowFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_workflows.json"
+            $null = $writtenFiles.Add(@{ File = $workflowFile; Tier = 2; Phase = 'workflows' })
+        }
     }
 
     # ===========================================
     # Environments Phase (Tier 2)
     # ===========================================
     if ($Collect -contains 'Environments' -and $repos) {
-        Write-Host "[*] Enumerating Organization Environments"
-        $environments = $repos | Git-HoundEnvironment -Session $Session -ThrottleLimit $ThrottleLimit
+        if ($completedPhases -notcontains 'environments') {
+            Write-Host "[*] Enumerating Organization Environments"
+            $environments = $repos | Git-HoundEnvironment -Session $Session -ThrottleLimit $ThrottleLimit
 
-        $envNodes = New-Object System.Collections.ArrayList
-        $envEdges = New-Object System.Collections.ArrayList
-        if ($environments.nodes) { $null = $envNodes.AddRange(@($environments.nodes)) }
-        if ($environments.edges) { $null = $envEdges.AddRange(@($environments.edges)) }
+            $envNodes = New-Object System.Collections.ArrayList
+            $envEdges = New-Object System.Collections.ArrayList
+            if ($environments.nodes) { $null = $envNodes.AddRange(@($environments.nodes)) }
+            if ($environments.edges) { $null = $envEdges.AddRange(@($environments.edges)) }
 
-        $envFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
-            -PhaseName 'environments' -Tier 2 -Nodes $envNodes -Edges $envEdges
-        $null = $writtenFiles.Add(@{ File = $envFile; Tier = 2; Phase = 'environments' })
+            $envFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
+                -PhaseName 'environments' -Tier 2 -Nodes $envNodes -Edges $envEdges
+            $null = $writtenFiles.Add(@{ File = $envFile; Tier = 2; Phase = 'environments' })
 
-        if ($environments.nodes) { $null = $allNodes.AddRange(@($environments.nodes)) }
-        if ($environments.edges) { $null = $allEdges.AddRange(@($environments.edges)) }
+            if ($environments.nodes) { $null = $allNodes.AddRange(@($environments.nodes)) }
+            if ($environments.edges) { $null = $allEdges.AddRange(@($environments.edges)) }
+
+            $completedPhases += 'environments'
+            Save-Checkpoint
+        } else {
+            Write-Host "[*] Skipping environments phase (already completed)"
+            $envFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_environments.json"
+            $null = $writtenFiles.Add(@{ File = $envFile; Tier = 2; Phase = 'environments' })
+        }
     }
 
     # ===========================================
     # Secrets Phase (Tier 2)
     # ===========================================
     if ($Collect -contains 'Secrets' -and $repos) {
-        Write-Host "[*] Enumerating Organization Secrets"
-        $secrets = $repos | Git-HoundSecret -Session $Session -ThrottleLimit $ThrottleLimit
+        if ($completedPhases -notcontains 'secrets') {
+            Write-Host "[*] Enumerating Organization Secrets"
+            $secrets = $repos | Git-HoundSecret -Session $Session -ThrottleLimit $ThrottleLimit
 
-        $secretNodes = New-Object System.Collections.ArrayList
-        $secretEdges = New-Object System.Collections.ArrayList
-        if ($secrets.nodes) { $null = $secretNodes.AddRange(@($secrets.nodes)) }
-        if ($secrets.edges) { $null = $secretEdges.AddRange(@($secrets.edges)) }
+            $secretNodes = New-Object System.Collections.ArrayList
+            $secretEdges = New-Object System.Collections.ArrayList
+            if ($secrets.nodes) { $null = $secretNodes.AddRange(@($secrets.nodes)) }
+            if ($secrets.edges) { $null = $secretEdges.AddRange(@($secrets.edges)) }
 
-        $secretFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
-            -PhaseName 'secrets' -Tier 2 -Nodes $secretNodes -Edges $secretEdges
-        $null = $writtenFiles.Add(@{ File = $secretFile; Tier = 2; Phase = 'secrets' })
+            $secretFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
+                -PhaseName 'secrets' -Tier 2 -Nodes $secretNodes -Edges $secretEdges
+            $null = $writtenFiles.Add(@{ File = $secretFile; Tier = 2; Phase = 'secrets' })
 
-        if ($secrets.nodes) { $null = $allNodes.AddRange(@($secrets.nodes)) }
-        if ($secrets.edges) { $null = $allEdges.AddRange(@($secrets.edges)) }
+            if ($secrets.nodes) { $null = $allNodes.AddRange(@($secrets.nodes)) }
+            if ($secrets.edges) { $null = $allEdges.AddRange(@($secrets.edges)) }
+
+            $completedPhases += 'secrets'
+            Save-Checkpoint
+        } else {
+            Write-Host "[*] Skipping secrets phase (already completed)"
+            $secretFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_secrets.json"
+            $null = $writtenFiles.Add(@{ File = $secretFile; Tier = 2; Phase = 'secrets' })
+        }
     }
 
     # ===========================================
     # Secret Scanning Phase (Tier 2)
     # ===========================================
     if ($Collect -contains 'SecretScanning') {
-        Write-Host "[*] Enumerating Secret Scanning Alerts"
-        $secretalerts = $org.nodes[0] | Git-HoundSecretScanningAlert -Session $Session
+        if ($completedPhases -notcontains 'secretscanning') {
+            Write-Host "[*] Enumerating Secret Scanning Alerts"
+            $secretalerts = $org.nodes[0] | Git-HoundSecretScanningAlert -Session $Session
 
-        $ssNodes = New-Object System.Collections.ArrayList
-        $ssEdges = New-Object System.Collections.ArrayList
-        if ($secretalerts.nodes) { $null = $ssNodes.AddRange(@($secretalerts.nodes)) }
-        if ($secretalerts.edges) { $null = $ssEdges.AddRange(@($secretalerts.edges)) }
+            $ssNodes = New-Object System.Collections.ArrayList
+            $ssEdges = New-Object System.Collections.ArrayList
+            if ($secretalerts.nodes) { $null = $ssNodes.AddRange(@($secretalerts.nodes)) }
+            if ($secretalerts.edges) { $null = $ssEdges.AddRange(@($secretalerts.edges)) }
 
-        $ssFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
-            -PhaseName 'secretscanning' -Tier 2 -Nodes $ssNodes -Edges $ssEdges
-        $null = $writtenFiles.Add(@{ File = $ssFile; Tier = 2; Phase = 'secretscanning' })
+            $ssFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
+                -PhaseName 'secretscanning' -Tier 2 -Nodes $ssNodes -Edges $ssEdges
+            $null = $writtenFiles.Add(@{ File = $ssFile; Tier = 2; Phase = 'secretscanning' })
 
-        if ($secretalerts.nodes) { $null = $allNodes.AddRange(@($secretalerts.nodes)) }
-        if ($secretalerts.edges) { $null = $allEdges.AddRange(@($secretalerts.edges)) }
+            if ($secretalerts.nodes) { $null = $allNodes.AddRange(@($secretalerts.nodes)) }
+            if ($secretalerts.edges) { $null = $allEdges.AddRange(@($secretalerts.edges)) }
+
+            $completedPhases += 'secretscanning'
+            Save-Checkpoint
+        } else {
+            Write-Host "[*] Skipping secretscanning phase (already completed)"
+            $ssFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_secretscanning.json"
+            $null = $writtenFiles.Add(@{ File = $ssFile; Tier = 2; Phase = 'secretscanning' })
+        }
     }
 
     # ===========================================
     # App Installations Phase (Tier 2)
     # ===========================================
     if ($Collect -contains 'AppInstallations') {
-        Write-Host "[*] Enumerating App Installations"
-        $appInstallations = $org.nodes[0] | Git-HoundAppInstallation -Session $Session
+        if ($completedPhases -notcontains 'appinstallations') {
+            Write-Host "[*] Enumerating App Installations"
+            $appInstallations = $org.nodes[0] | Git-HoundAppInstallation -Session $Session
 
-        $appNodes = New-Object System.Collections.ArrayList
-        $appEdges = New-Object System.Collections.ArrayList
-        if ($appInstallations.nodes) { $null = $appNodes.AddRange(@($appInstallations.nodes)) }
-        if ($appInstallations.edges) { $null = $appEdges.AddRange(@($appInstallations.edges)) }
+            $appNodes = New-Object System.Collections.ArrayList
+            $appEdges = New-Object System.Collections.ArrayList
+            if ($appInstallations.nodes) { $null = $appNodes.AddRange(@($appInstallations.nodes)) }
+            if ($appInstallations.edges) { $null = $appEdges.AddRange(@($appInstallations.edges)) }
 
-        $appFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
-            -PhaseName 'appinstallations' -Tier 2 -Nodes $appNodes -Edges $appEdges
-        $null = $writtenFiles.Add(@{ File = $appFile; Tier = 2; Phase = 'appinstallations' })
+            $appFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
+                -PhaseName 'appinstallations' -Tier 2 -Nodes $appNodes -Edges $appEdges
+            $null = $writtenFiles.Add(@{ File = $appFile; Tier = 2; Phase = 'appinstallations' })
 
-        if ($appInstallations.nodes) { $null = $allNodes.AddRange(@($appInstallations.nodes)) }
-        if ($appInstallations.edges) { $null = $allEdges.AddRange(@($appInstallations.edges)) }
+            if ($appInstallations.nodes) { $null = $allNodes.AddRange(@($appInstallations.nodes)) }
+            if ($appInstallations.edges) { $null = $allEdges.AddRange(@($appInstallations.edges)) }
+
+            $completedPhases += 'appinstallations'
+            Save-Checkpoint
+        } else {
+            Write-Host "[*] Skipping appinstallations phase (already completed)"
+            $appFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_appinstallations.json"
+            $null = $writtenFiles.Add(@{ File = $appFile; Tier = 2; Phase = 'appinstallations' })
+        }
     }
 
     # ===========================================
     # Team Roles Phase (Tier 3)
     # ===========================================
     if ($Collect -contains 'TeamRoles') {
-        Write-Host "[*] Enumerating Team Roles"
-        $teamroles = $org.nodes[0] | Git-HoundTeamRole -Session $Session -ThrottleLimit $ThrottleLimit
+        if ($completedPhases -notcontains 'teamroles') {
+            Write-Host "[*] Enumerating Team Roles"
+            $teamroles = $org.nodes[0] | Git-HoundTeamRole -Session $Session -ThrottleLimit $ThrottleLimit
 
-        $trNodes = New-Object System.Collections.ArrayList
-        $trEdges = New-Object System.Collections.ArrayList
-        if ($teamroles.nodes) { $null = $trNodes.AddRange(@($teamroles.nodes)) }
-        if ($teamroles.edges) { $null = $trEdges.AddRange(@($teamroles.edges)) }
+            $trNodes = New-Object System.Collections.ArrayList
+            $trEdges = New-Object System.Collections.ArrayList
+            if ($teamroles.nodes) { $null = $trNodes.AddRange(@($teamroles.nodes)) }
+            if ($teamroles.edges) { $null = $trEdges.AddRange(@($teamroles.edges)) }
 
-        $trFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
-            -PhaseName 'teamroles' -Tier 3 -Nodes $trNodes -Edges $trEdges
-        $null = $writtenFiles.Add(@{ File = $trFile; Tier = 3; Phase = 'teamroles' })
+            $trFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
+                -PhaseName 'teamroles' -Tier 3 -Nodes $trNodes -Edges $trEdges
+            $null = $writtenFiles.Add(@{ File = $trFile; Tier = 3; Phase = 'teamroles' })
 
-        if ($teamroles.nodes) { $null = $allNodes.AddRange(@($teamroles.nodes)) }
-        if ($teamroles.edges) { $null = $allEdges.AddRange(@($teamroles.edges)) }
+            if ($teamroles.nodes) { $null = $allNodes.AddRange(@($teamroles.nodes)) }
+            if ($teamroles.edges) { $null = $allEdges.AddRange(@($teamroles.edges)) }
+
+            $completedPhases += 'teamroles'
+            Save-Checkpoint
+        } else {
+            Write-Host "[*] Skipping teamroles phase (already completed)"
+            $trFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_teamroles.json"
+            $null = $writtenFiles.Add(@{ File = $trFile; Tier = 3; Phase = 'teamroles' })
+        }
     }
 
     # ===========================================
     # Org Roles Phase (Tier 3)
     # ===========================================
     if ($Collect -contains 'OrgRoles') {
-        Write-Host "[*] Enumerating Organization Roles"
-        $orgroles = $org.nodes[0] | Git-HoundOrganizationRole -Session $Session -UserLimit $UserLimit -ThrottleLimit $ThrottleLimit
+        if ($completedPhases -notcontains 'orgroles') {
+            Write-Host "[*] Enumerating Organization Roles"
+            $orgroles = $org.nodes[0] | Git-HoundOrganizationRole -Session $Session -UserLimit $UserLimit -ThrottleLimit $ThrottleLimit
 
-        $orNodes = New-Object System.Collections.ArrayList
-        $orEdges = New-Object System.Collections.ArrayList
-        if ($orgroles.nodes) { $null = $orNodes.AddRange(@($orgroles.nodes)) }
-        if ($orgroles.edges) { $null = $orEdges.AddRange(@($orgroles.edges)) }
+            $orNodes = New-Object System.Collections.ArrayList
+            $orEdges = New-Object System.Collections.ArrayList
+            if ($orgroles.nodes) { $null = $orNodes.AddRange(@($orgroles.nodes)) }
+            if ($orgroles.edges) { $null = $orEdges.AddRange(@($orgroles.edges)) }
 
-        $orFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
-            -PhaseName 'orgroles' -Tier 3 -Nodes $orNodes -Edges $orEdges
-        $null = $writtenFiles.Add(@{ File = $orFile; Tier = 3; Phase = 'orgroles' })
+            $orFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
+                -PhaseName 'orgroles' -Tier 3 -Nodes $orNodes -Edges $orEdges
+            $null = $writtenFiles.Add(@{ File = $orFile; Tier = 3; Phase = 'orgroles' })
 
-        if ($orgroles.nodes) { $null = $allNodes.AddRange(@($orgroles.nodes)) }
-        if ($orgroles.edges) { $null = $allEdges.AddRange(@($orgroles.edges)) }
+            if ($orgroles.nodes) { $null = $allNodes.AddRange(@($orgroles.nodes)) }
+            if ($orgroles.edges) { $null = $allEdges.AddRange(@($orgroles.edges)) }
+
+            $completedPhases += 'orgroles'
+            Save-Checkpoint
+        } else {
+            Write-Host "[*] Skipping orgroles phase (already completed)"
+            $orFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_orgroles.json"
+            $null = $writtenFiles.Add(@{ File = $orFile; Tier = 3; Phase = 'orgroles' })
+        }
     }
 
     # ===========================================
     # Repo Roles Phase (Tier 3)
     # ===========================================
     if ($Collect -contains 'RepoRoles') {
-        Write-Host "[*] Enumerating Repository Roles"
-        $reporoles = $org.nodes[0] | Git-HoundRepositoryRole -Session $Session -ThrottleLimit $ThrottleLimit
+        if ($completedPhases -notcontains 'reporoles') {
+            Write-Host "[*] Enumerating Repository Roles"
+            $reporoles = $org.nodes[0] | Git-HoundRepositoryRole -Session $Session -ThrottleLimit $ThrottleLimit
 
-        $rrNodes = New-Object System.Collections.ArrayList
-        $rrEdges = New-Object System.Collections.ArrayList
-        if ($reporoles.nodes) { $null = $rrNodes.AddRange(@($reporoles.nodes)) }
-        if ($reporoles.edges) { $null = $rrEdges.AddRange(@($reporoles.edges)) }
+            $rrNodes = New-Object System.Collections.ArrayList
+            $rrEdges = New-Object System.Collections.ArrayList
+            if ($reporoles.nodes) { $null = $rrNodes.AddRange(@($reporoles.nodes)) }
+            if ($reporoles.edges) { $null = $rrEdges.AddRange(@($reporoles.edges)) }
 
-        $rrFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
-            -PhaseName 'reporoles' -Tier 3 -Nodes $rrNodes -Edges $rrEdges
-        $null = $writtenFiles.Add(@{ File = $rrFile; Tier = 3; Phase = 'reporoles' })
+            $rrFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
+                -PhaseName 'reporoles' -Tier 3 -Nodes $rrNodes -Edges $rrEdges
+            $null = $writtenFiles.Add(@{ File = $rrFile; Tier = 3; Phase = 'reporoles' })
 
-        if ($reporoles.nodes) { $null = $allNodes.AddRange(@($reporoles.nodes)) }
-        if ($reporoles.edges) { $null = $allEdges.AddRange(@($reporoles.edges)) }
+            if ($reporoles.nodes) { $null = $allNodes.AddRange(@($reporoles.nodes)) }
+            if ($reporoles.edges) { $null = $allEdges.AddRange(@($reporoles.edges)) }
+
+            $completedPhases += 'reporoles'
+            Save-Checkpoint
+        } else {
+            Write-Host "[*] Skipping reporoles phase (already completed)"
+            $rrFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_reporoles.json"
+            $null = $writtenFiles.Add(@{ File = $rrFile; Tier = 3; Phase = 'reporoles' })
+        }
     }
 
     # ===========================================
     # SAML Phase (Tier 4)
     # ===========================================
     if ($Collect -contains 'SAML') {
-        Write-Host "[*] Enumerating SAML Identity Provider"
-        $saml = Git-HoundGraphQlSamlProvider -Session $Session
+        if ($completedPhases -notcontains 'saml') {
+            Write-Host "[*] Enumerating SAML Identity Provider"
+            $saml = Git-HoundGraphQlSamlProvider -Session $Session
 
-        $samlNodes = New-Object System.Collections.ArrayList
-        $samlEdges = New-Object System.Collections.ArrayList
-        if ($saml.nodes) { $null = $samlNodes.AddRange(@($saml.nodes)) }
-        if ($saml.edges) { $null = $samlEdges.AddRange(@($saml.edges)) }
+            $samlNodes = New-Object System.Collections.ArrayList
+            $samlEdges = New-Object System.Collections.ArrayList
+            if ($saml.nodes) { $null = $samlNodes.AddRange(@($saml.nodes)) }
+            if ($saml.edges) { $null = $samlEdges.AddRange(@($saml.edges)) }
 
-        $samlFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
-            -PhaseName 'saml' -Tier 4 -Nodes $samlNodes -Edges $samlEdges
-        $null = $writtenFiles.Add(@{ File = $samlFile; Tier = 4; Phase = 'saml' })
+            $samlFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
+                -PhaseName 'saml' -Tier 4 -Nodes $samlNodes -Edges $samlEdges
+            $null = $writtenFiles.Add(@{ File = $samlFile; Tier = 4; Phase = 'saml' })
 
-        if ($saml.nodes) { $null = $allNodes.AddRange(@($saml.nodes)) }
-        if ($saml.edges) { $null = $allEdges.AddRange(@($saml.edges)) }
+            if ($saml.nodes) { $null = $allNodes.AddRange(@($saml.nodes)) }
+            if ($saml.edges) { $null = $allEdges.AddRange(@($saml.edges)) }
+
+            $completedPhases += 'saml'
+            Save-Checkpoint
+        } else {
+            Write-Host "[*] Skipping saml phase (already completed)"
+            $samlFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_saml.json"
+            $null = $writtenFiles.Add(@{ File = $samlFile; Tier = 4; Phase = 'saml' })
+        }
     }
 
     # ===========================================
@@ -3200,6 +3453,15 @@ function Invoke-GitHound
     Write-Host "  - $(Split-Path $combinedFile -Leaf)"
     Write-Host ""
     Write-Host "============================================="
+
+    # ===========================================
+    # Cleanup checkpoint (collection complete)
+    # ===========================================
+    $checkpointPath = Join-Path -Path $outputFolder -ChildPath "_checkpoint.json"
+    if (Test-Path $checkpointPath) {
+        Remove-Item -Path $checkpointPath -Force
+        Write-Host "[*] Checkpoint file removed (collection complete)"
+    }
 
     # ===========================================
     # Zip Output (if requested)
