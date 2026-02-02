@@ -509,6 +509,93 @@ function ConvertTo-PascalCase
     return $pascalCaseString
 }
 
+function Write-GitHoundPayload {
+    <#
+    .SYNOPSIS
+        Writes GitHound data to a JSON file with proper formatting.
+
+    .DESCRIPTION
+        Creates a JSON payload file containing nodes and edges for BloodHound ingestion.
+        Supports per-phase incremental output with tier information for proper ingestion ordering.
+
+    .PARAMETER OutputPath
+        The directory path where the JSON file will be written.
+
+    .PARAMETER Timestamp
+        A timestamp string to include in the filename for uniqueness.
+
+    .PARAMETER OrgName
+        The organization name to include in the filename.
+
+    .PARAMETER PhaseName
+        The name of the collection phase (e.g., 'organization', 'users', 'repos').
+
+    .PARAMETER Tier
+        The ingestion tier (1-4) indicating upload order priority.
+
+    .PARAMETER Nodes
+        An ArrayList of node objects to include in the payload.
+
+    .PARAMETER Edges
+        An ArrayList of edge objects to include in the payload.
+
+    .OUTPUTS
+        Returns the full path to the written JSON file.
+
+    .EXAMPLE
+        $file = Write-GitHoundPayload -OutputPath './' -Timestamp '20240101120000' -OrgName 'my-org' -PhaseName 'users' -Tier 1 -Nodes $userNodes -Edges $userEdges
+    #>
+    Param(
+        [Parameter(Mandatory = $true)]
+        [string]$OutputPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Timestamp,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OrgName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PhaseName,
+
+        [Parameter(Mandatory = $true)]
+        [int]$Tier,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.ArrayList]$Nodes,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.ArrayList]$Edges
+    )
+
+    $filename = "${Timestamp}_${OrgName}_${PhaseName}.json"
+    $filepath = Join-Path -Path $OutputPath -ChildPath $filename
+
+    $payload = [PSCustomObject]@{
+        metadata = [PSCustomObject]@{
+            source_kind = "GitHub"
+            phase = $PhaseName
+            tier = $Tier
+            organization = $OrgName
+            timestamp = $Timestamp
+        }
+        graph = [PSCustomObject]@{
+            nodes = $Nodes.ToArray()
+            edges = $Edges.ToArray()
+        }
+    }
+
+    $payload | ConvertTo-Json -Depth 10 | Out-File -FilePath $filepath
+
+    if ($Tier -gt 0) {
+        Write-Host "[+] Tier $Tier - Wrote $($Nodes.Count) nodes and $($Edges.Count) edges to $filename"
+    } else {
+        Write-Host "[+] Wrote combined output with $($Nodes.Count) nodes and $($Edges.Count) edges to $filename"
+    }
+
+    return $filepath
+}
+
 function Git-HoundOrganization
 {
     <#
@@ -679,6 +766,12 @@ function Git-HoundUser
     .PARAMETER Organization
         A GitHound.Organization object representing the organization for which users are to be fetched.
 
+    .PARAMETER Limit
+        Optional limit on the number of users to process. If 0 or not specified, all users are processed.
+
+    .PARAMETER ThrottleLimit
+        Maximum number of parallel threads for API calls. Defaults to 25.
+
     .EXAMPLE
         $users = Git-HoundOrganization | Git-HoundUser
     #>
@@ -689,13 +782,23 @@ function Git-HoundUser
 
         [Parameter(Position = 1, Mandatory = $true, ValueFromPipeline = $true)]
         [PSObject]
-        $Organization
+        $Organization,
+
+        [Parameter(Mandatory = $false)]
+        [int]$Limit = 0,
+
+        [Parameter(Mandatory = $false)]
+        [int]$ThrottleLimit = 25
     )
 
     $nodes = New-Object System.Collections.ArrayList
 
+    $members = Invoke-GithubRestMethod -Session $Session -Path "orgs/$($Organization.Properties.login)/members"
+    if ($Limit -gt 0) {
+        $members = $members | Select-Object -First $Limit
+    }
 
-    Invoke-GithubRestMethod -Session $Session -Path "orgs/$($Organization.Properties.login)/members" | ForEach-Object -Parallel {
+    $members | ForEach-Object -Parallel {
         
         $nodes = $using:nodes
         $Session = $using:Session
@@ -739,7 +842,7 @@ function Git-HoundUser
         }
         
         $null = $nodes.Add((New-GitHoundNode -Id $user.node_id -Kind 'GHUser' -Properties $properties))
-    } -ThrottleLimit 25
+    } -ThrottleLimit $ThrottleLimit
 
     Write-Output $nodes
 }
@@ -881,6 +984,9 @@ function Git-HoundBranch
     .PARAMETER Repository
         A GitHound.Repository object representing the repository for which branches are to be fetched.
 
+    .PARAMETER ThrottleLimit
+        Maximum number of parallel threads for API calls. Defaults to 25.
+
     .EXAMPLE
         $branches = Git-HoundRepository | Git-HoundBranch
     #>
@@ -891,7 +997,10 @@ function Git-HoundBranch
 
         [Parameter(Position = 1, Mandatory = $true, ValueFromPipeline)]
         [psobject[]]
-        $Repository
+        $Repository,
+
+        [Parameter(Mandatory = $false)]
+        [int]$ThrottleLimit = 25
     )
     
     begin
@@ -1043,7 +1152,7 @@ function Git-HoundBranch
                 $null = $nodes.Add((New-GitHoundNode -Id $branchId -Kind GHBranch -Properties $props))
                 $null = $edges.Add((New-GitHoundEdge -Kind GHHasBranch -StartId $repo.id -EndId $branchId -Properties @{ traversable = $true }))
             }
-        } -ThrottleLimit 25
+        } -ThrottleLimit $ThrottleLimit
     }
 
     end
@@ -1052,7 +1161,7 @@ function Git-HoundBranch
             Nodes = $nodes
             Edges = $edges
         }
-    
+
         Write-Output $output
     }
 }
@@ -1081,6 +1190,9 @@ function Git-HoundWorkflow
     .OUTPUTS
         A PSObject containing arrays of nodes and edges representing the workflows and their relationships.
 
+    .PARAMETER ThrottleLimit
+        Maximum number of parallel threads for API calls. Defaults to 25.
+
     .EXAMPLE
         $workflows = Git-HoundRepository | Git-HoundWorkflow
     #>
@@ -1091,9 +1203,12 @@ function Git-HoundWorkflow
 
         [Parameter(Position = 1, Mandatory = $true, ValueFromPipeline)]
         [psobject[]]
-        $Repository
+        $Repository,
+
+        [Parameter(Mandatory = $false)]
+        [int]$ThrottleLimit = 25
     )
-    
+
     begin
     {
         $nodes = New-Object System.Collections.ArrayList
@@ -1106,6 +1221,7 @@ function Git-HoundWorkflow
             $nodes = $using:nodes
             $edges = $using:edges
             $Session = $using:Session
+            $ThrottleLimit = $using:ThrottleLimit
             $functionBundle = $using:GitHoundFunctionBundle
             foreach($funcName in $functionBundle.Keys) {
                 Set-Item -Path "function:$funcName" -Value ([scriptblock]::Create($functionBundle[$funcName]))
@@ -1138,7 +1254,7 @@ function Git-HoundWorkflow
                 $null = $nodes.Add((New-GitHoundNode -Id $workflow.node_id -Kind GHWorkflow -Properties $props))
                 $null = $edges.Add((New-GitHoundEdge -Kind GHHasWorkflow -StartId $repo.properties.node_id -EndId $workflow.node_id -Properties @{ traversable = $false }))
             }
-        } -ThrottleLimit 25
+        } -ThrottleLimit $ThrottleLimit
     }
 
     end
@@ -1147,7 +1263,7 @@ function Git-HoundWorkflow
             Nodes = $nodes
             Edges = $edges
         }
-    
+
         Write-Output $output
     }
 }
@@ -1179,6 +1295,9 @@ function Git-HoundEnvironment
     .OUTPUTS
         A PSObject containing arrays of nodes and edges representing the environments and their relationships.
 
+    .PARAMETER ThrottleLimit
+        Maximum number of parallel threads for API calls. Defaults to 25.
+
     .EXAMPLE
         $environments = Git-HoundRepository | Git-HoundEnvironment
     #>
@@ -1189,9 +1308,12 @@ function Git-HoundEnvironment
 
         [Parameter(Position = 1, Mandatory = $true, ValueFromPipeline)]
         [psobject[]]
-        $Repository
+        $Repository,
+
+        [Parameter(Mandatory = $false)]
+        [int]$ThrottleLimit = 25
     )
-    
+
     begin
     {
         $nodes = New-Object System.Collections.ArrayList
@@ -1273,7 +1395,7 @@ function Git-HoundEnvironment
                     $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasSecret' -StartId $environment.node_id -EndId $secretId -Properties @{ traversable = $false }))
                 }
             }
-        } -ThrottleLimit 25
+        } -ThrottleLimit $ThrottleLimit
     }
 
     end
@@ -1282,7 +1404,7 @@ function Git-HoundEnvironment
             Nodes = $nodes
             Edges = $edges
         }
-    
+
         Write-Output $output
     }
 }
@@ -1314,6 +1436,9 @@ function Git-HoundSecret
     .OUTPUTS
         A PSObject containing arrays of nodes and edges representing the environments and their relationships.
 
+    .PARAMETER ThrottleLimit
+        Maximum number of parallel threads for API calls. Defaults to 25.
+
     .EXAMPLE
         $secrets = Git-HoundRepository | Git-HoundSecret
 
@@ -1325,7 +1450,10 @@ function Git-HoundSecret
 
         [Parameter(Position = 1, Mandatory = $true, ValueFromPipeline)]
         [psobject[]]
-        $Repository
+        $Repository,
+
+        [Parameter(Mandatory = $false)]
+        [int]$ThrottleLimit = 25
     )
     
     begin
@@ -1407,7 +1535,7 @@ function Git-HoundSecret
                 $null = $edges.Add((New-GitHoundEdge -Kind 'GHContains' -StartId $repo.properties.node_id -EndId $secretId -Properties @{ traversable = $false }))
                 $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasSecret' -StartId $repo.properties.node_id -EndId $secretId -Properties @{ traversable = $false }))
             }
-        } -ThrottleLimit 25
+        } -ThrottleLimit $ThrottleLimit
     }
 
     end
@@ -1416,7 +1544,7 @@ function Git-HoundSecret
             Nodes = $nodes
             Edges = $edges
         }
-    
+
         Write-Output $output
     }
 }
@@ -1450,6 +1578,12 @@ function Git-HoundOrganizationRole
     .OUTPUTS
         A PSObject containing arrays of nodes and edges representing the organization roles and their relationships.
 
+    .PARAMETER UserLimit
+        Optional limit on the number of users to enumerate for membership. If 0 or not specified, all users are enumerated.
+
+    .PARAMETER ThrottleLimit
+        Maximum number of parallel threads for API calls. Defaults to 25.
+
     .EXAMPLE
         $orgRoles = Git-HoundOrganization | Git-HoundOrganizationRole
     #>
@@ -1460,7 +1594,13 @@ function Git-HoundOrganizationRole
 
         [Parameter(Position = 1, Mandatory = $true, ValueFromPipeline = $true)]
         [PSObject]
-        $Organization
+        $Organization,
+
+        [Parameter(Mandatory = $false)]
+        [int]$UserLimit = 0,
+
+        [Parameter(Mandatory = $false)]
+        [int]$ThrottleLimit = 25
     )
 
     $nodes = New-Object System.Collections.ArrayList
@@ -1609,8 +1749,13 @@ function Git-HoundOrganizationRole
 
     # Need to add custom role membership here
     # This is a great place to parallelize, because we must enumerate users and then check their memberships individually
-    Invoke-GithubRestMethod -Session $Session -Path "orgs/$($organization.Properties.login)/members" | ForEach-Object -Parallel {
-        
+    $members = Invoke-GithubRestMethod -Session $Session -Path "orgs/$($organization.Properties.login)/members"
+    if ($UserLimit -gt 0) {
+        $members = $members | Select-Object -First $UserLimit
+    }
+
+    $members | ForEach-Object -Parallel {
+
         $edges = $using:edges
         $Session = $using:Session
         $Organization = $using:Organization
@@ -1621,7 +1766,7 @@ function Git-HoundOrganizationRole
             Set-Item -Path "function:$funcName" -Value ([scriptblock]::Create($functionBundle[$funcName]))
         }
         $user = $_
-        
+
         switch((Invoke-GithubRestMethod -Session $Session -Path "orgs/$($organization.Properties.login)/memberships/$($user.login)").role)
         {
             'admin' { $destId = $orgOwnersId}
@@ -1630,7 +1775,7 @@ function Git-HoundOrganizationRole
             #'security admin' { $orgsecurityList.Add($m) }
         }
         $null = $edges.Add($(New-GitHoundEdge -Kind 'GHHasRole' -StartId $user.node_id -EndId $destId -Properties @{traversable=$true}))
-    } -ThrottleLimit 25
+    } -ThrottleLimit $ThrottleLimit
 
     $output = [PSCustomObject]@{
         Nodes = $nodes
@@ -1669,6 +1814,9 @@ function Git-HoundTeamRole
     .OUTPUTS
         A PSObject containing arrays of nodes and edges representing the team roles and their relationships.
 
+    .PARAMETER ThrottleLimit
+        Maximum number of parallel threads for API calls. Defaults to 25.
+
     .EXAMPLE
         $teamRoles = Git-HoundOrganization | Git-HoundTeamRole
     #>
@@ -1679,18 +1827,22 @@ function Git-HoundTeamRole
 
         [Parameter(Position = 1, Mandatory = $true, ValueFromPipeline = $true)]
         [PSObject]
-        $Organization
+        $Organization,
+
+        [Parameter(Mandatory = $false)]
+        [int]$ThrottleLimit = 25
     )
 
     $nodes = New-Object System.Collections.ArrayList
     $edges = New-Object System.Collections.ArrayList
 
     Invoke-GithubRestMethod -Session $Session -Path "orgs/$($Organization.Properties.login)/teams" | ForEach-Object -Parallel {
-        
+
         $nodes = $using:nodes
         $edges = $using:edges
         $Session = $using:Session
         $Organization = $using:Organization
+        $ThrottleLimit = $using:ThrottleLimit
 
         $functionBundle = $using:GitHoundFunctionBundle
         foreach($funcName in $functionBundle.Keys) {
@@ -1748,7 +1900,7 @@ function Git-HoundTeamRole
             }
             $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasRole' -StartId $member.node_id -EndId $targetId -Properties @{traversable=$true}))
         }
-    } -ThrottleLimit 25
+    } -ThrottleLimit $ThrottleLimit
 
     $output = [PSCustomObject]@{
         Nodes = $nodes
@@ -1789,6 +1941,9 @@ function Git-HoundRepositoryRole
     .OUTPUTS
         A PSObject containing arrays of nodes and edges representing the repository roles and their relationships.
 
+    .PARAMETER ThrottleLimit
+        Maximum number of parallel threads for API calls. Defaults to 25.
+
     .EXAMPLE
         $repoRoles = Git-HoundOrganization | Git-HoundRepositoryRole
     #>
@@ -1800,7 +1955,10 @@ function Git-HoundRepositoryRole
 
         [Parameter(Position = 1, Mandatory = $true, ValueFromPipeline = $true)]
         [PSObject]
-        $Organization
+        $Organization,
+
+        [Parameter(Mandatory = $false)]
+        [int]$ThrottleLimit = 25
     )
 
     $nodes = New-Object System.Collections.ArrayList
@@ -2151,7 +2309,7 @@ function Git-HoundRepositoryRole
             }
             $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasRole' -StartId $team.node_id -EndId $repoRoleId -Properties @{traversable=$true}))
         }
-    } -ThrottleLimit 25
+    } -ThrottleLimit $ThrottleLimit
 
     $output = [PSCustomObject]@{
         Nodes = $nodes
@@ -2562,105 +2720,466 @@ query SAML($login: String!, $count: Int = 100, $after: String = null) {
 
 function Invoke-GitHound
 {
+    <#
+    .SYNOPSIS
+        Main entry point for GitHound collection. Supports selective collection, filtering, and per-phase incremental output.
+
+    .DESCRIPTION
+        Collects GitHub organization data and outputs per-phase JSON files for BloodHound ingestion.
+        Supports selective collection via -Collect parameter, filtering via -RepoFilter and -RepoVisibility,
+        and operational controls via -UserLimit, -ThrottleLimit, and -OutputPath.
+
+    .PARAMETER Session
+        A GitHound.Session object used for authentication and API requests.
+
+    .PARAMETER Collect
+        Array of collection phases to run. Defaults to 'All'.
+        Valid values: All, Users, Teams, Repos, Branches, Workflows, Environments, Secrets,
+                      TeamRoles, OrgRoles, RepoRoles, SecretScanning, AppInstallations, SAML
+
+    .PARAMETER UserLimit
+        Limit number of users to enumerate. 0 means no limit (default).
+
+    .PARAMETER RepoFilter
+        Wildcard pattern to filter repositories by name (e.g., 'api-*').
+
+    .PARAMETER RepoVisibility
+        Filter repositories by visibility: all, public, private, internal. Defaults to 'all'.
+
+    .PARAMETER OutputPath
+        Directory path for output files. Defaults to current directory.
+
+    .PARAMETER ThrottleLimit
+        Maximum parallel threads for API calls. Defaults to 25.
+
+    .EXAMPLE
+        $session = New-GithubSession -OrganizationName "my-org" -Token $token
+        Invoke-GitHound -Session $session
+
+    .EXAMPLE
+        Invoke-GitHound -Session $session -Collect @('Users', 'Repos', 'Branches') -RepoFilter 'api-*'
+
+    .EXAMPLE
+        Invoke-GitHound -Session $session -Collect @('Branches') -OutputPath './output/'
+    #>
     [CmdletBinding()]
     Param(
         [Parameter(Position = 0, Mandatory = $true)]
         [PSTypeName('GitHound.Session')]
-        $Session
+        $Session,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('All', 'Users', 'Teams', 'Repos', 'Branches', 'Workflows',
+                     'Environments', 'Secrets', 'TeamRoles', 'OrgRoles',
+                     'RepoRoles', 'SecretScanning', 'AppInstallations', 'SAML')]
+        [string[]]$Collect = @('All'),
+
+        [Parameter(Mandatory = $false)]
+        [int]$UserLimit = 0,
+
+        [Parameter(Mandatory = $false)]
+        [string]$RepoFilter = '',
+
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('all', 'public', 'private', 'internal')]
+        [string]$RepoVisibility = 'all',
+
+        [Parameter(Mandatory = $false)]
+        [string]$OutputPath = './',
+
+        [Parameter(Mandatory = $false)]
+        [int]$ThrottleLimit = 25
     )
 
-    $nodes = New-Object System.Collections.ArrayList
-    $edges = New-Object System.Collections.ArrayList
-    
+    # Resolve 'All' to explicit phases
+    if ($Collect -contains 'All') {
+        $Collect = @('Users', 'Teams', 'Repos', 'Branches', 'Workflows',
+                     'Environments', 'Secrets', 'TeamRoles', 'OrgRoles',
+                     'RepoRoles', 'SecretScanning', 'AppInstallations', 'SAML')
+    }
+
+    # Auto-include Repos if any repo-dependent phase is selected
+    $repoDependentPhases = @('Branches', 'Workflows', 'Environments', 'Secrets')
+    foreach ($phase in $repoDependentPhases) {
+        if ($Collect -contains $phase -and $Collect -notcontains 'Repos') {
+            Write-Host "[!] Auto-including Repos collection (required dependency for $phase)"
+            $Collect = @('Repos') + $Collect
+            break
+        }
+    }
+
+    # Ensure output directory exists
+    if (-not (Test-Path $OutputPath)) {
+        New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
+    }
+
+    # Generate timestamp for filenames
+    $timestamp = Get-Date -Format "yyyyMMddHHmmss"
+    $orgName = $Session.OrganizationName
+
+    # Track written files for ingestion order summary
+    $writtenFiles = New-Object System.Collections.ArrayList
+
+    # Initialize combined nodes/edges for final combined output
+    $allNodes = New-Object System.Collections.ArrayList
+    $allEdges = New-Object System.Collections.ArrayList
+
     $Global:GitHoundFunctionBundle = Get-GitHoundFunctionBundle
 
-    Write-Host "[*] Starting GitHound for $($Session.OrganizationName)"
+    # ===========================================
+    # Organization Phase (ALWAYS runs - Tier 1)
+    # ===========================================
+    Write-Host "[*] Starting GitHound for $orgName"
     $org = Git-HoundOrganization -Session $Session
-    if($org.nodes) { $nodes.AddRange(@($org.nodes)) }
-    if($org.edges) { $edges.AddRange(@($org.edges)) }
 
-    Write-Host "[*] Enumerating Organization Users"
-    $users = $org.nodes[0] | Git-HoundUser -Session $Session
-    if($users) { $nodes.AddRange(@($users)) }
+    $orgNodes = New-Object System.Collections.ArrayList
+    $orgEdges = New-Object System.Collections.ArrayList
+    if ($org.nodes) { $null = $orgNodes.AddRange(@($org.nodes)) }
+    if ($org.edges) { $null = $orgEdges.AddRange(@($org.edges)) }
 
-    Write-Host "[*] Enumerating Organization Teams"
-    $teams = $org.nodes[0] | Git-HoundTeam -Session $Session
-    if($teams.nodes) { $nodes.AddRange(@($teams.nodes)) }
-    if($teams.edges) { $edges.AddRange(@($teams.edges)) }
+    $orgFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+        -PhaseName 'organization' -Tier 1 -Nodes $orgNodes -Edges $orgEdges
+    $null = $writtenFiles.Add(@{ File = $orgFile; Tier = 1; Phase = 'organization' })
 
-    Write-Host "[*] Enumerating Organization Repositories"
-    $repos = $org.nodes[0] | Git-HoundRepository -Session $Session
-    if($repos.nodes) { $nodes.AddRange(@($repos.nodes)) }
-    if($repos.edges) { $edges.AddRange(@($repos.edges)) }
+    if ($org.nodes) { $null = $allNodes.AddRange(@($org.nodes)) }
+    if ($org.edges) { $null = $allEdges.AddRange(@($org.edges)) }
 
-    Write-Host "[*] Enumerating Organization Branches"
-    $branches = $repos | Git-HoundBranch -Session $Session
-    if($branches.nodes) { $nodes.AddRange(@($branches.nodes)) }
-    if($branches.edges) { $edges.AddRange(@($branches.edges)) }
+    # ===========================================
+    # Users Phase (Tier 1)
+    # ===========================================
+    if ($Collect -contains 'Users') {
+        Write-Host "[*] Enumerating Organization Users"
+        $users = $org.nodes[0] | Git-HoundUser -Session $Session -Limit $UserLimit -ThrottleLimit $ThrottleLimit
 
-    Write-Host "[*] Enumerating Organization Workflows"
-    $workflows = $repos | Git-HoundWorkflow -Session $Session
-    if($workflows.nodes) { $nodes.AddRange(@($workflows.nodes)) }
-    if($workflows.edges) { $edges.AddRange(@($workflows.edges)) }
+        $userNodes = New-Object System.Collections.ArrayList
+        $userEdges = New-Object System.Collections.ArrayList
+        if ($users) { $null = $userNodes.AddRange(@($users)) }
 
-    Write-Host "[*] Enumerating Organization Environments"
-    $environments = $repos | Git-HoundEnvironment -Session $Session
-    if($environments.nodes) { $nodes.AddRange(@($environments.nodes)) }
-    if($environments.edges) { $edges.AddRange(@($environments.edges)) }
+        $userFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+            -PhaseName 'users' -Tier 1 -Nodes $userNodes -Edges $userEdges
+        $null = $writtenFiles.Add(@{ File = $userFile; Tier = 1; Phase = 'users' })
 
-    Write-Host "[*] Enumerating Organization Secrets"
-    $secrets = $repos | Git-HoundSecret -Session $Session
-    if($secrets.nodes) { $nodes.AddRange(@($secrets.nodes)) }
-    if($secrets.edges) { $edges.AddRange(@($secrets.edges)) }
+        if ($users) { $null = $allNodes.AddRange(@($users)) }
+    }
 
-    Write-Host "[*] Enumerating Team Roles"
-    $teamroles = $org.nodes[0] | Git-HoundTeamRole -Session $Session
-    if($teamroles.nodes) { $nodes.AddRange(@($teamroles.nodes)) }
-    if($teamroles.edges) { $edges.AddRange(@($teamroles.edges)) }
+    # ===========================================
+    # Teams Phase (Tier 1)
+    # ===========================================
+    if ($Collect -contains 'Teams') {
+        Write-Host "[*] Enumerating Organization Teams"
+        $teams = $org.nodes[0] | Git-HoundTeam -Session $Session
 
-    Write-Host "[*] Enumerating Organization Roles"
-    $orgroles = $org.nodes[0] | Git-HoundOrganizationRole -Session $Session
-    if($orgroles.nodes) { $nodes.AddRange(@($orgroles.nodes)) }
-    if($orgroles.edges) { $edges.AddRange(@($orgroles.edges)) }
+        $teamNodes = New-Object System.Collections.ArrayList
+        $teamEdges = New-Object System.Collections.ArrayList
+        if ($teams.nodes) { $null = $teamNodes.AddRange(@($teams.nodes)) }
+        if ($teams.edges) { $null = $teamEdges.AddRange(@($teams.edges)) }
 
-    Write-Host "[*] Enumerating Repository Roles"
-    $reporoles = $org.nodes[0] | Git-HoundRepositoryRole -Session $Session
-    if($reporoles.nodes) { $nodes.AddRange(@($reporoles.nodes)) }
-    if($reporoles.edges) { $edges.AddRange(@($reporoles.edges)) }
-    
-    Write-Host "[*] Enumerating Secret Scanning Alerts"
-    $secretalerts = $org.nodes[0] | Git-HoundSecretScanningAlert -Session $Session
-    if($secretalerts.nodes) { $nodes.AddRange(@($secretalerts.nodes)) }
-    if($secretalerts.edges) { $edges.AddRange(@($secretalerts.edges)) }
+        $teamFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+            -PhaseName 'teams' -Tier 1 -Nodes $teamNodes -Edges $teamEdges
+        $null = $writtenFiles.Add(@{ File = $teamFile; Tier = 1; Phase = 'teams' })
 
-    Write-Host "[*] Enumerating App Installations"
-    $appInstallations = $org.nodes[0] | Git-HoundAppInstallation -Session $Session
-    if($appInstallations.nodes) { $nodes.AddRange(@($appInstallations.nodes)) }
-    if($appInstallations.edges) { $edges.AddRange(@($appInstallations.edges)) }
+        if ($teams.nodes) { $null = $allNodes.AddRange(@($teams.nodes)) }
+        if ($teams.edges) { $null = $allEdges.AddRange(@($teams.edges)) }
+    }
 
-    Write-Host "[*] Converting to OpenGraph JSON Payload"
-    $payload = [PSCustomObject]@{
-        metadata = [PSCustomObject]@{
-            source_kind = "GitHub"
+    # ===========================================
+    # Repos Phase (Tier 1)
+    # ===========================================
+    $repos = $null
+    if ($Collect -contains 'Repos') {
+        Write-Host "[*] Enumerating Organization Repositories"
+        $repos = $org.nodes[0] | Git-HoundRepository -Session $Session
+
+        # Apply RepoFilter
+        if ($RepoFilter -ne '') {
+            $filteredNodes = $repos.nodes | Where-Object { $_.properties.name -like $RepoFilter }
+            $repos.nodes = $filteredNodes
+            Write-Host "[*] Filtered to $($repos.nodes.Count) repositories matching '$RepoFilter'"
         }
-        graph = [PSCustomObject]@{
-            nodes = $nodes.ToArray()
-            edges = $edges.ToArray()
+
+        # Apply RepoVisibility filter
+        if ($RepoVisibility -ne 'all') {
+            $filteredNodes = $repos.nodes | Where-Object { $_.properties.visibility -eq $RepoVisibility }
+            $repos.nodes = $filteredNodes
+            Write-Host "[*] Filtered to $($repos.nodes.Count) $RepoVisibility repositories"
         }
-    } | ConvertTo-Json -Depth 10 | Out-File -FilePath "./githound_$($org.nodes[0].id).json"
 
-
-    Write-Host "[*] Enumerating SAML Identity Provider"
-    $samlNodes = New-Object System.Collections.ArrayList
-    $samlEdges = New-Object System.Collections.ArrayList
-    $saml = Git-HoundGraphQlSamlProvider -Session $Session
-    if($saml.nodes) { $samlNodes.AddRange(@($saml.nodes)) }
-    if($saml.edges) { $samlEdges.AddRange(@($saml.edges)) }
-
-    $payload = [PSCustomObject]@{
-        graph = [PSCustomObject]@{
-            nodes = $samlNodes.ToArray()
-            edges = $samlEdges.ToArray()
+        # Rebuild edges to only include filtered repos
+        if ($RepoFilter -ne '' -or $RepoVisibility -ne 'all') {
+            $filteredRepoIds = $repos.nodes | ForEach-Object { $_.id }
+            $repos.edges = $repos.edges | Where-Object { $filteredRepoIds -contains $_.end.value }
         }
-    } | ConvertTo-Json -Depth 10 | Out-File -FilePath "./githound_saml_$($org.nodes[0].id).json"
+
+        $repoNodes = New-Object System.Collections.ArrayList
+        $repoEdges = New-Object System.Collections.ArrayList
+        if ($repos.nodes) { $null = $repoNodes.AddRange(@($repos.nodes)) }
+        if ($repos.edges) { $null = $repoEdges.AddRange(@($repos.edges)) }
+
+        $repoFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+            -PhaseName 'repos' -Tier 1 -Nodes $repoNodes -Edges $repoEdges
+        $null = $writtenFiles.Add(@{ File = $repoFile; Tier = 1; Phase = 'repos' })
+
+        if ($repos.nodes) { $null = $allNodes.AddRange(@($repos.nodes)) }
+        if ($repos.edges) { $null = $allEdges.AddRange(@($repos.edges)) }
+    }
+
+    # ===========================================
+    # Branches Phase (Tier 2)
+    # ===========================================
+    if ($Collect -contains 'Branches' -and $repos) {
+        Write-Host "[*] Enumerating Organization Branches"
+        $branches = $repos | Git-HoundBranch -Session $Session -ThrottleLimit $ThrottleLimit
+
+        $branchNodes = New-Object System.Collections.ArrayList
+        $branchEdges = New-Object System.Collections.ArrayList
+        if ($branches.nodes) { $null = $branchNodes.AddRange(@($branches.nodes)) }
+        if ($branches.edges) { $null = $branchEdges.AddRange(@($branches.edges)) }
+
+        $branchFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+            -PhaseName 'branches' -Tier 2 -Nodes $branchNodes -Edges $branchEdges
+        $null = $writtenFiles.Add(@{ File = $branchFile; Tier = 2; Phase = 'branches' })
+
+        if ($branches.nodes) { $null = $allNodes.AddRange(@($branches.nodes)) }
+        if ($branches.edges) { $null = $allEdges.AddRange(@($branches.edges)) }
+    }
+
+    # ===========================================
+    # Workflows Phase (Tier 2)
+    # ===========================================
+    if ($Collect -contains 'Workflows' -and $repos) {
+        Write-Host "[*] Enumerating Organization Workflows"
+        $workflows = $repos | Git-HoundWorkflow -Session $Session -ThrottleLimit $ThrottleLimit
+
+        $workflowNodes = New-Object System.Collections.ArrayList
+        $workflowEdges = New-Object System.Collections.ArrayList
+        if ($workflows.nodes) { $null = $workflowNodes.AddRange(@($workflows.nodes)) }
+        if ($workflows.edges) { $null = $workflowEdges.AddRange(@($workflows.edges)) }
+
+        $workflowFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+            -PhaseName 'workflows' -Tier 2 -Nodes $workflowNodes -Edges $workflowEdges
+        $null = $writtenFiles.Add(@{ File = $workflowFile; Tier = 2; Phase = 'workflows' })
+
+        if ($workflows.nodes) { $null = $allNodes.AddRange(@($workflows.nodes)) }
+        if ($workflows.edges) { $null = $allEdges.AddRange(@($workflows.edges)) }
+    }
+
+    # ===========================================
+    # Environments Phase (Tier 2)
+    # ===========================================
+    if ($Collect -contains 'Environments' -and $repos) {
+        Write-Host "[*] Enumerating Organization Environments"
+        $environments = $repos | Git-HoundEnvironment -Session $Session -ThrottleLimit $ThrottleLimit
+
+        $envNodes = New-Object System.Collections.ArrayList
+        $envEdges = New-Object System.Collections.ArrayList
+        if ($environments.nodes) { $null = $envNodes.AddRange(@($environments.nodes)) }
+        if ($environments.edges) { $null = $envEdges.AddRange(@($environments.edges)) }
+
+        $envFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+            -PhaseName 'environments' -Tier 2 -Nodes $envNodes -Edges $envEdges
+        $null = $writtenFiles.Add(@{ File = $envFile; Tier = 2; Phase = 'environments' })
+
+        if ($environments.nodes) { $null = $allNodes.AddRange(@($environments.nodes)) }
+        if ($environments.edges) { $null = $allEdges.AddRange(@($environments.edges)) }
+    }
+
+    # ===========================================
+    # Secrets Phase (Tier 2)
+    # ===========================================
+    if ($Collect -contains 'Secrets' -and $repos) {
+        Write-Host "[*] Enumerating Organization Secrets"
+        $secrets = $repos | Git-HoundSecret -Session $Session -ThrottleLimit $ThrottleLimit
+
+        $secretNodes = New-Object System.Collections.ArrayList
+        $secretEdges = New-Object System.Collections.ArrayList
+        if ($secrets.nodes) { $null = $secretNodes.AddRange(@($secrets.nodes)) }
+        if ($secrets.edges) { $null = $secretEdges.AddRange(@($secrets.edges)) }
+
+        $secretFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+            -PhaseName 'secrets' -Tier 2 -Nodes $secretNodes -Edges $secretEdges
+        $null = $writtenFiles.Add(@{ File = $secretFile; Tier = 2; Phase = 'secrets' })
+
+        if ($secrets.nodes) { $null = $allNodes.AddRange(@($secrets.nodes)) }
+        if ($secrets.edges) { $null = $allEdges.AddRange(@($secrets.edges)) }
+    }
+
+    # ===========================================
+    # Secret Scanning Phase (Tier 2)
+    # ===========================================
+    if ($Collect -contains 'SecretScanning') {
+        Write-Host "[*] Enumerating Secret Scanning Alerts"
+        $secretalerts = $org.nodes[0] | Git-HoundSecretScanningAlert -Session $Session
+
+        $ssNodes = New-Object System.Collections.ArrayList
+        $ssEdges = New-Object System.Collections.ArrayList
+        if ($secretalerts.nodes) { $null = $ssNodes.AddRange(@($secretalerts.nodes)) }
+        if ($secretalerts.edges) { $null = $ssEdges.AddRange(@($secretalerts.edges)) }
+
+        $ssFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+            -PhaseName 'secretscanning' -Tier 2 -Nodes $ssNodes -Edges $ssEdges
+        $null = $writtenFiles.Add(@{ File = $ssFile; Tier = 2; Phase = 'secretscanning' })
+
+        if ($secretalerts.nodes) { $null = $allNodes.AddRange(@($secretalerts.nodes)) }
+        if ($secretalerts.edges) { $null = $allEdges.AddRange(@($secretalerts.edges)) }
+    }
+
+    # ===========================================
+    # App Installations Phase (Tier 2)
+    # ===========================================
+    if ($Collect -contains 'AppInstallations') {
+        Write-Host "[*] Enumerating App Installations"
+        $appInstallations = $org.nodes[0] | Git-HoundAppInstallation -Session $Session
+
+        $appNodes = New-Object System.Collections.ArrayList
+        $appEdges = New-Object System.Collections.ArrayList
+        if ($appInstallations.nodes) { $null = $appNodes.AddRange(@($appInstallations.nodes)) }
+        if ($appInstallations.edges) { $null = $appEdges.AddRange(@($appInstallations.edges)) }
+
+        $appFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+            -PhaseName 'appinstallations' -Tier 2 -Nodes $appNodes -Edges $appEdges
+        $null = $writtenFiles.Add(@{ File = $appFile; Tier = 2; Phase = 'appinstallations' })
+
+        if ($appInstallations.nodes) { $null = $allNodes.AddRange(@($appInstallations.nodes)) }
+        if ($appInstallations.edges) { $null = $allEdges.AddRange(@($appInstallations.edges)) }
+    }
+
+    # ===========================================
+    # Team Roles Phase (Tier 3)
+    # ===========================================
+    if ($Collect -contains 'TeamRoles') {
+        Write-Host "[*] Enumerating Team Roles"
+        $teamroles = $org.nodes[0] | Git-HoundTeamRole -Session $Session -ThrottleLimit $ThrottleLimit
+
+        $trNodes = New-Object System.Collections.ArrayList
+        $trEdges = New-Object System.Collections.ArrayList
+        if ($teamroles.nodes) { $null = $trNodes.AddRange(@($teamroles.nodes)) }
+        if ($teamroles.edges) { $null = $trEdges.AddRange(@($teamroles.edges)) }
+
+        $trFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+            -PhaseName 'teamroles' -Tier 3 -Nodes $trNodes -Edges $trEdges
+        $null = $writtenFiles.Add(@{ File = $trFile; Tier = 3; Phase = 'teamroles' })
+
+        if ($teamroles.nodes) { $null = $allNodes.AddRange(@($teamroles.nodes)) }
+        if ($teamroles.edges) { $null = $allEdges.AddRange(@($teamroles.edges)) }
+    }
+
+    # ===========================================
+    # Org Roles Phase (Tier 3)
+    # ===========================================
+    if ($Collect -contains 'OrgRoles') {
+        Write-Host "[*] Enumerating Organization Roles"
+        $orgroles = $org.nodes[0] | Git-HoundOrganizationRole -Session $Session -UserLimit $UserLimit -ThrottleLimit $ThrottleLimit
+
+        $orNodes = New-Object System.Collections.ArrayList
+        $orEdges = New-Object System.Collections.ArrayList
+        if ($orgroles.nodes) { $null = $orNodes.AddRange(@($orgroles.nodes)) }
+        if ($orgroles.edges) { $null = $orEdges.AddRange(@($orgroles.edges)) }
+
+        $orFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+            -PhaseName 'orgroles' -Tier 3 -Nodes $orNodes -Edges $orEdges
+        $null = $writtenFiles.Add(@{ File = $orFile; Tier = 3; Phase = 'orgroles' })
+
+        if ($orgroles.nodes) { $null = $allNodes.AddRange(@($orgroles.nodes)) }
+        if ($orgroles.edges) { $null = $allEdges.AddRange(@($orgroles.edges)) }
+    }
+
+    # ===========================================
+    # Repo Roles Phase (Tier 3)
+    # ===========================================
+    if ($Collect -contains 'RepoRoles') {
+        Write-Host "[*] Enumerating Repository Roles"
+        $reporoles = $org.nodes[0] | Git-HoundRepositoryRole -Session $Session -ThrottleLimit $ThrottleLimit
+
+        $rrNodes = New-Object System.Collections.ArrayList
+        $rrEdges = New-Object System.Collections.ArrayList
+        if ($reporoles.nodes) { $null = $rrNodes.AddRange(@($reporoles.nodes)) }
+        if ($reporoles.edges) { $null = $rrEdges.AddRange(@($reporoles.edges)) }
+
+        $rrFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+            -PhaseName 'reporoles' -Tier 3 -Nodes $rrNodes -Edges $rrEdges
+        $null = $writtenFiles.Add(@{ File = $rrFile; Tier = 3; Phase = 'reporoles' })
+
+        if ($reporoles.nodes) { $null = $allNodes.AddRange(@($reporoles.nodes)) }
+        if ($reporoles.edges) { $null = $allEdges.AddRange(@($reporoles.edges)) }
+    }
+
+    # ===========================================
+    # SAML Phase (Tier 4)
+    # ===========================================
+    if ($Collect -contains 'SAML') {
+        Write-Host "[*] Enumerating SAML Identity Provider"
+        $saml = Git-HoundGraphQlSamlProvider -Session $Session
+
+        $samlNodes = New-Object System.Collections.ArrayList
+        $samlEdges = New-Object System.Collections.ArrayList
+        if ($saml.nodes) { $null = $samlNodes.AddRange(@($saml.nodes)) }
+        if ($saml.edges) { $null = $samlEdges.AddRange(@($saml.edges)) }
+
+        $samlFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+            -PhaseName 'saml' -Tier 4 -Nodes $samlNodes -Edges $samlEdges
+        $null = $writtenFiles.Add(@{ File = $samlFile; Tier = 4; Phase = 'saml' })
+
+        if ($saml.nodes) { $null = $allNodes.AddRange(@($saml.nodes)) }
+        if ($saml.edges) { $null = $allEdges.AddRange(@($saml.edges)) }
+    }
+
+    # ===========================================
+    # Combined Output (Tier 0 - for reference)
+    # ===========================================
+    Write-Host "[*] Writing combined output"
+    $combinedFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+        -PhaseName 'combined' -Tier 0 -Nodes $allNodes -Edges $allEdges
+
+    # ===========================================
+    # Ingestion Order Summary
+    # ===========================================
+    Write-Host ""
+    Write-Host "============================================="
+    Write-Host "BLOODHOUND INGESTION ORDER"
+    Write-Host "Upload files in this order for proper graph construction:"
+    Write-Host "============================================="
+    Write-Host ""
+
+    # Group files by tier
+    $tier1Files = $writtenFiles | Where-Object { $_.Tier -eq 1 }
+    $tier2Files = $writtenFiles | Where-Object { $_.Tier -eq 2 }
+    $tier3Files = $writtenFiles | Where-Object { $_.Tier -eq 3 }
+    $tier4Files = $writtenFiles | Where-Object { $_.Tier -eq 4 }
+
+    if ($tier1Files.Count -gt 0) {
+        Write-Host "Tier 1 - Foundation (upload first):"
+        foreach ($f in $tier1Files) {
+            Write-Host "  - $(Split-Path $f.File -Leaf)"
+        }
+        Write-Host ""
+    }
+
+    if ($tier2Files.Count -gt 0) {
+        Write-Host "Tier 2 - Sub-entities:"
+        foreach ($f in $tier2Files) {
+            Write-Host "  - $(Split-Path $f.File -Leaf)"
+        }
+        Write-Host ""
+    }
+
+    if ($tier3Files.Count -gt 0) {
+        Write-Host "Tier 3 - Role nodes and membership edges:"
+        foreach ($f in $tier3Files) {
+            Write-Host "  - $(Split-Path $f.File -Leaf)"
+        }
+        Write-Host ""
+    }
+
+    if ($tier4Files.Count -gt 0) {
+        Write-Host "Tier 4 - SAML (upload last):"
+        foreach ($f in $tier4Files) {
+            Write-Host "  - $(Split-Path $f.File -Leaf)"
+        }
+        Write-Host ""
+    }
+
+    Write-Host "Combined output (alternative to tier-by-tier upload):"
+    Write-Host "  - $(Split-Path $combinedFile -Leaf)"
+    Write-Host ""
+    Write-Host "============================================="
 }
