@@ -2749,10 +2749,14 @@ function Invoke-GitHound
         Filter repositories by visibility: all, public, private, internal. Defaults to 'all'.
 
     .PARAMETER OutputPath
-        Directory path for output files. Defaults to current directory.
+        Base directory path for output. A timestamped subfolder will be created (e.g., 20240101120000_my-org/).
+        Defaults to current directory.
 
     .PARAMETER ThrottleLimit
         Maximum parallel threads for API calls. Defaults to 25.
+
+    .PARAMETER Zip
+        If specified, compresses all output files into a zip archive and removes the output folder.
 
     .EXAMPLE
         $session = New-GithubSession -OrganizationName "my-org" -Token $token
@@ -2763,6 +2767,9 @@ function Invoke-GitHound
 
     .EXAMPLE
         Invoke-GitHound -Session $session -Collect @('Branches') -OutputPath './output/'
+
+    .EXAMPLE
+        Invoke-GitHound -Session $session -Zip
     #>
     [CmdletBinding()]
     Param(
@@ -2790,7 +2797,10 @@ function Invoke-GitHound
         [string]$OutputPath = './',
 
         [Parameter(Mandatory = $false)]
-        [int]$ThrottleLimit = 25
+        [int]$ThrottleLimit = 25,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$Zip
     )
 
     # Resolve 'All' to explicit phases
@@ -2810,14 +2820,20 @@ function Invoke-GitHound
         }
     }
 
-    # Ensure output directory exists
+    # Generate timestamp and create output folder
+    $timestamp = Get-Date -Format "yyyyMMddHHmmss"
+    $orgName = $Session.OrganizationName
+    $folderName = "${timestamp}_${orgName}"
+    $outputFolder = Join-Path -Path $OutputPath -ChildPath $folderName
+
+    # Ensure base output directory exists
     if (-not (Test-Path $OutputPath)) {
         New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
     }
 
-    # Generate timestamp for filenames
-    $timestamp = Get-Date -Format "yyyyMMddHHmmss"
-    $orgName = $Session.OrganizationName
+    # Create timestamped output folder for this run
+    New-Item -ItemType Directory -Path $outputFolder -Force | Out-Null
+    Write-Host "[*] Output folder: $outputFolder"
 
     # Track written files for ingestion order summary
     $writtenFiles = New-Object System.Collections.ArrayList
@@ -2839,7 +2855,7 @@ function Invoke-GitHound
     if ($org.nodes) { $null = $orgNodes.AddRange(@($org.nodes)) }
     if ($org.edges) { $null = $orgEdges.AddRange(@($org.edges)) }
 
-    $orgFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+    $orgFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgName `
         -PhaseName 'organization' -Tier 1 -Nodes $orgNodes -Edges $orgEdges
     $null = $writtenFiles.Add(@{ File = $orgFile; Tier = 1; Phase = 'organization' })
 
@@ -2857,7 +2873,7 @@ function Invoke-GitHound
         $userEdges = New-Object System.Collections.ArrayList
         if ($users) { $null = $userNodes.AddRange(@($users)) }
 
-        $userFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+        $userFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgName `
             -PhaseName 'users' -Tier 1 -Nodes $userNodes -Edges $userEdges
         $null = $writtenFiles.Add(@{ File = $userFile; Tier = 1; Phase = 'users' })
 
@@ -2876,7 +2892,7 @@ function Invoke-GitHound
         if ($teams.nodes) { $null = $teamNodes.AddRange(@($teams.nodes)) }
         if ($teams.edges) { $null = $teamEdges.AddRange(@($teams.edges)) }
 
-        $teamFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+        $teamFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgName `
             -PhaseName 'teams' -Tier 1 -Nodes $teamNodes -Edges $teamEdges
         $null = $writtenFiles.Add(@{ File = $teamFile; Tier = 1; Phase = 'teams' })
 
@@ -2917,7 +2933,7 @@ function Invoke-GitHound
         if ($repos.nodes) { $null = $repoNodes.AddRange(@($repos.nodes)) }
         if ($repos.edges) { $null = $repoEdges.AddRange(@($repos.edges)) }
 
-        $repoFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+        $repoFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgName `
             -PhaseName 'repos' -Tier 1 -Nodes $repoNodes -Edges $repoEdges
         $null = $writtenFiles.Add(@{ File = $repoFile; Tier = 1; Phase = 'repos' })
 
@@ -2937,7 +2953,7 @@ function Invoke-GitHound
         if ($branches.nodes) { $null = $branchNodes.AddRange(@($branches.nodes)) }
         if ($branches.edges) { $null = $branchEdges.AddRange(@($branches.edges)) }
 
-        $branchFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+        $branchFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgName `
             -PhaseName 'branches' -Tier 2 -Nodes $branchNodes -Edges $branchEdges
         $null = $writtenFiles.Add(@{ File = $branchFile; Tier = 2; Phase = 'branches' })
 
@@ -2957,7 +2973,7 @@ function Invoke-GitHound
         if ($workflows.nodes) { $null = $workflowNodes.AddRange(@($workflows.nodes)) }
         if ($workflows.edges) { $null = $workflowEdges.AddRange(@($workflows.edges)) }
 
-        $workflowFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+        $workflowFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgName `
             -PhaseName 'workflows' -Tier 2 -Nodes $workflowNodes -Edges $workflowEdges
         $null = $writtenFiles.Add(@{ File = $workflowFile; Tier = 2; Phase = 'workflows' })
 
@@ -2977,7 +2993,7 @@ function Invoke-GitHound
         if ($environments.nodes) { $null = $envNodes.AddRange(@($environments.nodes)) }
         if ($environments.edges) { $null = $envEdges.AddRange(@($environments.edges)) }
 
-        $envFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+        $envFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgName `
             -PhaseName 'environments' -Tier 2 -Nodes $envNodes -Edges $envEdges
         $null = $writtenFiles.Add(@{ File = $envFile; Tier = 2; Phase = 'environments' })
 
@@ -2997,7 +3013,7 @@ function Invoke-GitHound
         if ($secrets.nodes) { $null = $secretNodes.AddRange(@($secrets.nodes)) }
         if ($secrets.edges) { $null = $secretEdges.AddRange(@($secrets.edges)) }
 
-        $secretFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+        $secretFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgName `
             -PhaseName 'secrets' -Tier 2 -Nodes $secretNodes -Edges $secretEdges
         $null = $writtenFiles.Add(@{ File = $secretFile; Tier = 2; Phase = 'secrets' })
 
@@ -3017,7 +3033,7 @@ function Invoke-GitHound
         if ($secretalerts.nodes) { $null = $ssNodes.AddRange(@($secretalerts.nodes)) }
         if ($secretalerts.edges) { $null = $ssEdges.AddRange(@($secretalerts.edges)) }
 
-        $ssFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+        $ssFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgName `
             -PhaseName 'secretscanning' -Tier 2 -Nodes $ssNodes -Edges $ssEdges
         $null = $writtenFiles.Add(@{ File = $ssFile; Tier = 2; Phase = 'secretscanning' })
 
@@ -3037,7 +3053,7 @@ function Invoke-GitHound
         if ($appInstallations.nodes) { $null = $appNodes.AddRange(@($appInstallations.nodes)) }
         if ($appInstallations.edges) { $null = $appEdges.AddRange(@($appInstallations.edges)) }
 
-        $appFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+        $appFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgName `
             -PhaseName 'appinstallations' -Tier 2 -Nodes $appNodes -Edges $appEdges
         $null = $writtenFiles.Add(@{ File = $appFile; Tier = 2; Phase = 'appinstallations' })
 
@@ -3057,7 +3073,7 @@ function Invoke-GitHound
         if ($teamroles.nodes) { $null = $trNodes.AddRange(@($teamroles.nodes)) }
         if ($teamroles.edges) { $null = $trEdges.AddRange(@($teamroles.edges)) }
 
-        $trFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+        $trFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgName `
             -PhaseName 'teamroles' -Tier 3 -Nodes $trNodes -Edges $trEdges
         $null = $writtenFiles.Add(@{ File = $trFile; Tier = 3; Phase = 'teamroles' })
 
@@ -3077,7 +3093,7 @@ function Invoke-GitHound
         if ($orgroles.nodes) { $null = $orNodes.AddRange(@($orgroles.nodes)) }
         if ($orgroles.edges) { $null = $orEdges.AddRange(@($orgroles.edges)) }
 
-        $orFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+        $orFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgName `
             -PhaseName 'orgroles' -Tier 3 -Nodes $orNodes -Edges $orEdges
         $null = $writtenFiles.Add(@{ File = $orFile; Tier = 3; Phase = 'orgroles' })
 
@@ -3097,7 +3113,7 @@ function Invoke-GitHound
         if ($reporoles.nodes) { $null = $rrNodes.AddRange(@($reporoles.nodes)) }
         if ($reporoles.edges) { $null = $rrEdges.AddRange(@($reporoles.edges)) }
 
-        $rrFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+        $rrFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgName `
             -PhaseName 'reporoles' -Tier 3 -Nodes $rrNodes -Edges $rrEdges
         $null = $writtenFiles.Add(@{ File = $rrFile; Tier = 3; Phase = 'reporoles' })
 
@@ -3117,7 +3133,7 @@ function Invoke-GitHound
         if ($saml.nodes) { $null = $samlNodes.AddRange(@($saml.nodes)) }
         if ($saml.edges) { $null = $samlEdges.AddRange(@($saml.edges)) }
 
-        $samlFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+        $samlFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgName `
             -PhaseName 'saml' -Tier 4 -Nodes $samlNodes -Edges $samlEdges
         $null = $writtenFiles.Add(@{ File = $samlFile; Tier = 4; Phase = 'saml' })
 
@@ -3129,7 +3145,7 @@ function Invoke-GitHound
     # Combined Output (Tier 0 - for reference)
     # ===========================================
     Write-Host "[*] Writing combined output"
-    $combinedFile = Write-GitHoundPayload -OutputPath $OutputPath -Timestamp $timestamp -OrgName $orgName `
+    $combinedFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgName `
         -PhaseName 'combined' -Tier 0 -Nodes $allNodes -Edges $allEdges
 
     # ===========================================
@@ -3184,4 +3200,21 @@ function Invoke-GitHound
     Write-Host "  - $(Split-Path $combinedFile -Leaf)"
     Write-Host ""
     Write-Host "============================================="
+
+    # ===========================================
+    # Zip Output (if requested)
+    # ===========================================
+    if ($Zip) {
+        $zipPath = "${outputFolder}.zip"
+        Write-Host ""
+        Write-Host "[*] Creating zip archive: $zipPath"
+        Compress-Archive -Path "$outputFolder\*" -DestinationPath $zipPath -Force
+        Write-Host "[+] Zip archive created: $zipPath"
+        Write-Host "[*] Removing output folder..."
+        Remove-Item -Path $outputFolder -Recurse -Force
+        Write-Host "[+] Output folder removed. Only zip archive remains."
+    }
+
+    Write-Host ""
+    Write-Host "[*] GitHound collection complete!"
 }
