@@ -634,10 +634,6 @@ function Write-GitHoundPayload {
     $payload = [PSCustomObject]@{
         metadata = [PSCustomObject]@{
             source_kind = "GitHub"
-            phase = $PhaseName
-            tier = $Tier
-            organization = $OrgName
-            timestamp = $Timestamp
         }
         graph = [PSCustomObject]@{
             nodes = $safeNodes
@@ -1485,27 +1481,23 @@ function Git-HoundUser
 
         $properties = @{
             # Common Properties
-            id                  = Normalize-Null $user.id
-            node_id             = Normalize-Null $user.node_id
-            name                = Normalize-Null $user.login
-            # Relational Properties
-            organization_name   = Normalize-Null $Organization.properties.login
-            organization_id     = Normalize-Null $Organization.properties.node_id
-            # Node Specific Properties
-            login               = Normalize-Null $user.login
-            full_name           = Normalize-Null $user_details.name
-            company             = Normalize-Null $user_details.company
-            email               = Normalize-Null $user_details.email
-            twitter_username    = Normalize-Null $user_details.twitter_username
             type                = Normalize-Null $user.type
-            site_admin          = Normalize-Null $user.site_admin
+            node_id             = Normalize-Null $user.node_id
             # Accordion Panel Queries
-            query_roles         = "MATCH p=(t:GHUser {node_id:'$($user.node_id)'})-[:GHHasRole|GHMemberOf*1..4]->(:GitHub) RETURN p"
             query_teams         = "MATCH p=(:GHUser {node_id:'$($user.node_id)'})-[:GHHasRole]->(t:GHTeamRole)-[:GHMemberOf*1..4]->(:GHTeam) RETURN p"
             query_repositories  = "MATCH p=(t:GHUser {node_id:'$($user.node_id)'})-[:GHHasRole]->(:GHRepoRole)-[:GHReadRepoContents|GHWriteRepoContents|GHWriteRepoPullRequests|GHManageWebhooks|GHManageDeployKeys|GHPushProtectedBranch|GHDeleteAlertsCodeScanning|GHViewSecretScanningAlerts|GHRunOrgMigration|GHBypassBranchProtection|GHEditRepoProtections]->(:GHRepository) RETURN p"
             query_branches      = ""
+            id                  = Normalize-Null $user.id
+            login               = Normalize-Null $user.login
+            # Relational Properties
+            organization_name   = Normalize-Null $Organization.properties.login
+            name                = Normalize-Null $user.login
+            organization_id     = Normalize-Null $Organization.properties.node_id
+            # Node Specific Properties
+            site_admin          = Normalize-Null $user.site_admin
+            query_roles         = "MATCH p=(t:GHUser {node_id:'$($user.node_id)'})-[:GHHasRole|GHMemberOf*1..4]->(:GitHub) RETURN p"
         }
-        
+
         $null = $nodes.Add((New-GitHoundNode -Id $user.node_id -Kind 'GHUser' -Properties $properties))
     } -ThrottleLimit $ThrottleLimit
 
@@ -1612,7 +1604,6 @@ function Git-HoundRepository
             query_unrolled_readers       = "MATCH p=(:GitHub)-[:GHMemberOf|GHHasRole|GHHasBaseRole|GHReadRepoContents*1..]->(r:GHRepository {node_id:'$($repo.node_id)'}) RETURN p"
             query_explicit_writers       = "MATCH p=(role:GitHub)-[:GHHasBaseRole|GHWriteRepoContents|GHWriteRepoPullRequests*1..]->(r:GHRepository {node_id:'$($repo.node_id)'}) MATCH p1=(role)<-[:GHHasRole]-(:GHUser) RETURN p,p1"
             query_unrolled_writers       = "MATCH p=(:GitHub)-[:GHMemberOf|GHHasRole|GHHasBaseRole|GHWriteRepoContents|GHWriteRepoPullRequests*1..]->(r:GHRepository {node_id:'$($repo.node_id)'}) RETURN p"
-            #query_first_degree_object_control  = "MATCH p=(t:GHUser)-[:GHHasRole]->(:GHRepoRole)-[:GHReadRepoContents|GHWriteRepoContents|GHWriteRepoPullRequests|GHManageWebhooks|GHManageDeployKeys|GHPushProtectedBranch|GHDeleteAlertsCodeScanning|GHViewSecretScanningAlerts|GHRunOrgMigration|GHBypassBranchProtection|GHEditRepoProtections]->(:GHRepository {node_id:'$($repo.node_id)'}) RETURN p"
         }
         $null = $nodes.Add((New-GitHoundNode -Id $repo.node_id -Kind 'GHRepository' -Properties $properties))
         $null = $edges.Add((New-GitHoundEdge -Kind 'GHOwns' -StartId $repo.owner.node_id -EndId $repo.node_id -Properties @{ traversable = $true }))
@@ -1738,16 +1729,14 @@ function Git-HoundBranch
                             #$null = $edges.Add((New-GitHoundEdge -Kind GHBypassRequiredPullRequest -StartId $app.node_id -EndId $branchId -Properties @{ traversable = $false }))
                         }
 
-                        # We replaced BypassPrincipals with the above edges
-                        # Do we still need this value or is it implied by the edges?
-                        <#
+                        # Count bypass allowances for the property
+                        $BypassPrincipals = @($Protections.required_pull_request_reviews.bypass_pull_request_allowances.users) + @($Protections.required_pull_request_reviews.bypass_pull_request_allowances.teams)
                         if ($BypassPrincipals) {
                             $protection_bypass_pull_request_allowances = $BypassPrincipals.Count
                         }
                         else {
                             $protection_bypass_pull_request_allowances = 0
                         }
-                        #>
                     }
                     else {
                         $protection_required_pull_request_reviews = $false
@@ -1768,10 +1757,11 @@ function Git-HoundBranch
                         #   $null = $edges.Add((New-GitHoundEdge -Kind GHRestrictionsCanPush -StartId $app.node_id -EndId $branchId -Properties @{ traversable = $false }))
                         #}
 
-                        $protection_push_restrictions = $true
+                        $RestrictionPrincipals = @($Protections.restrictions.users) + @($Protections.restrictions.teams)
+                        $protection_push_restrictions = $RestrictionPrincipals.Count
                     }
                     else {
-                        $protection_push_restrictions = $false
+                        $protection_push_restrictions = 0
                     }
                 }
                 else 
@@ -1783,7 +1773,7 @@ function Git-HoundBranch
                     $protection_required_approving_review_count = 0
                     $protection_require_code_owner_reviews = $false
                     $protection_require_last_push_approval = $false
-                    #$protection_bypass_pull_request_allowances = $false
+                    $protection_bypass_pull_request_allowances = 0
                     $protection_push_restrictions = $false
                 }
 
@@ -1805,7 +1795,6 @@ function Git-HoundBranch
                     protection_required_approving_review_count = Normalize-Null $protection_required_approving_review_count
                     protection_require_code_owner_reviews      = Normalize-Null $protection_require_code_owner_reviews
                     protection_require_last_push_approval      = Normalize-Null $protection_require_last_push_approval
-                    #protection_bypass_pull_request_allowances  = Normalize-Null $protection_bypass_pull_request_allowances
                     protection_push_restrictions               = Normalize-Null $protection_push_restrictions
                     # Accordion Panel Queries
                     query_branch_write                         = "MATCH p=(:GHUser)-[:GHCanWriteBranch|GHCanEditAndWriteBranch]->(:GHBranch {objectid:'$($branchId)'}) RETURN p"
@@ -2396,14 +2385,14 @@ function Git-HoundOrganizationRole
     $orgMembersId = [Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("$($organization.id)_members"))
     $membersProps = [pscustomobject]@{
         # Common Properties
-        id                = Normalize-Null $orgMembersId
-        name              = Normalize-Null "$($Organization.Properties.login)/members"
+        id                     = Normalize-Null $orgMembersId
+        name                   = Normalize-Null "$($Organization.Properties.login)/members"
         # Relational Properties
-        organization_name = Normalize-Null $Organization.properties.login
-        organization_id   = Normalize-Null $Organization.properties.node_id
+        organization_name      = Normalize-Null $Organization.properties.login
+        organization_id        = Normalize-Null $Organization.properties.node_id
         # Node Specific Properties
-        short_name        = Normalize-Null 'members'
-        type              = Normalize-Null 'default'
+        short_name             = Normalize-Null 'members'
+        type                   = Normalize-Null 'default'
         # Accordion Panel Queries
         query_explicit_members = "MATCH p=(:GHUser)-[:GHHasRole]->(:GHOrgRole {id:'$($orgMembersId)'}) RETURN p"
         query_unrolled_members = "MATCH p=(:GHUser)-[:GHHasRole|GHHasBaseRole|GHMemberOf*1..]->(:GHOrgRole {id:'$($orgMembersId)'}) RETURN p"
@@ -2934,17 +2923,11 @@ function Git-HoundRepositoryRole
                 # Relational Properties
                 organization_name      = Normalize-Null $Organization.properties.login
                 organization_id        = Normalize-Null $Organization.properties.node_id
-                repository_name        = Normalize-Null $repo.name
-                repository_id          = Normalize-Null $repo.node_id
                 # Node Specific Properties
                 short_name             = Normalize-Null $customRepoRole.name
-                type                   = Normalize-Null 'custom'
-                # Accordion Panel Queries
-                query_explicit_members = "MATCH p=(:GHUser)-[:GHHasRole]->(:GHRepoRole {id:'$($customRepoRoleId)'}) RETURN p"
-                query_unrolled_members = "MATCH p=(:GHUser)-[:GHHasRole|GHHasBaseRole|GHMemberOf*1..]->(:GHRepoRole {id:'$($customRepoRoleId)'}) RETURN p"
-                query_repository       = "MATCH p=(:GHRepoRole {id:'$($customRepoRoleId)'})-[*]->(:GHRepository) RETURN p"
+                type                   = Normalize-Null 'repository'
             }
-            $null = $nodes.Add((New-GitHoundNode -Id $customRepoRoleId -Kind 'GHRepoRole', 'GHRole' -Properties $customRepoRoleProps))
+            $null = $nodes.Add((New-GitHoundNode -Id $customRepoRoleId -Kind 'GHRepoRole' -Properties $customRepoRoleProps))
             
             if($null -ne $customRepoRole.base_role)
             {
@@ -3335,9 +3318,6 @@ query SAML($login: String!, $count: Int = 100, $after: String = null) {
                 issuer                    = $result.data.organization.samlIdentityProvider.issuer
                 signature_method          = $result.data.organization.samlIdentityProvider.signatureMethod
                 sso_url                   = $result.data.organization.samlIdentityProvider.ssoUrl
-                # Accordion Panel Queries
-                query_environments        = "MATCH p=(:GHSamlIdentityProvider {objectid: '$($result.data.organization.samlIdentityProvider.id.ToUpper())'})<-[:GHHasSamlIdentityProvider]->(:GHOrganization) RETURN p"
-                query_external_identities = "MATCH p=(:GHSamlIdentityProvider {objectid: '$($result.data.organization.samlIdentityProvider.id.ToUpper())'})-[:GHHasExternalIdentity]->() RETURN p"
             }
 
             $null = $nodes.Add((New-GitHoundNode -Id $result.data.organization.samlIdentityProvider.id -Kind 'GHSamlIdentityProvider' -Properties $identityProviderProps))
@@ -3365,8 +3345,6 @@ query SAML($login: String!, $count: Int = 100, $after: String = null) {
                     scim_identity_username    = Normalize-Null $identity.scimIdentity.username
                     github_username           = Normalize-Null $identity.user.login
                     github_user_id            = Normalize-Null $identity.user.id
-                    # Accordion Panel Queries
-                    query_mapped_users = "MATCH p=(:GHExternalIdentity {objectid: '$($identity.id.ToUpper())'})-[:GHMapsToUser]->() RETURN p"
                 }
 
                 $null = $nodes.Add((New-GitHoundNode -Id $identity.id -Kind 'GHExternalIdentity' -Properties $EIprops))
