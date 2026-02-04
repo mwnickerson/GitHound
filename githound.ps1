@@ -1277,7 +1277,8 @@ function Git-HoundUser
         [int]$ThrottleLimit = 25
     )
 
-    $nodes = New-Object System.Collections.ArrayList
+    # Use thread-safe collection for parallel processing
+    $nodes = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
 
     $members = Invoke-GithubRestMethod -Session $Session -Path "orgs/$($Organization.Properties.login)/members"
     if ($Limit -gt 0) {
@@ -1285,7 +1286,7 @@ function Git-HoundUser
     }
 
     $members | ForEach-Object -Parallel {
-        
+
         $nodes = $using:nodes
         $Session = $using:Session
         $Organization = $using:Organization
@@ -1488,11 +1489,12 @@ function Git-HoundBranch
         [Parameter(Mandatory = $false)]
         [int]$ThrottleLimit = 25
     )
-    
+
     begin
     {
-        $nodes = New-Object System.Collections.ArrayList
-        $edges = New-Object System.Collections.ArrayList
+        # Use thread-safe collections for parallel processing
+        $nodes = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+        $edges = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
     }
 
     process
@@ -1697,8 +1699,9 @@ function Git-HoundWorkflow
 
     begin
     {
-        $nodes = New-Object System.Collections.ArrayList
-        $edges = New-Object System.Collections.ArrayList
+        # Use thread-safe collections for parallel processing
+        $nodes = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+        $edges = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
     }
 
     process
@@ -1802,8 +1805,9 @@ function Git-HoundEnvironment
 
     begin
     {
-        $nodes = New-Object System.Collections.ArrayList
-        $edges = New-Object System.Collections.ArrayList
+        # Use thread-safe collections for parallel processing
+        $nodes = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+        $edges = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
     }
 
     process
@@ -1941,11 +1945,12 @@ function Git-HoundSecret
         [Parameter(Mandatory = $false)]
         [int]$ThrottleLimit = 25
     )
-    
+
     begin
     {
-        $nodes = New-Object System.Collections.ArrayList
-        $edges = New-Object System.Collections.ArrayList
+        # Use thread-safe collections for parallel processing
+        $nodes = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+        $edges = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
 
         $org = Invoke-GithubRestMethod -Session $Session -Path "orgs/$($Session.OrganizationName)"
 
@@ -2326,8 +2331,9 @@ function Git-HoundTeamRole
         [int]$ThrottleLimit = 25
     )
 
-    $nodes = New-Object System.Collections.ArrayList
-    $edges = New-Object System.Collections.ArrayList
+    # Use thread-safe collections for parallel processing
+    $nodes = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+    $edges = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
 
     Invoke-GithubRestMethod -Session $Session -Path "orgs/$($Organization.Properties.login)/teams" | ForEach-Object -Parallel {
 
