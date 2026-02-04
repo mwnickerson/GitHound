@@ -665,7 +665,8 @@ function Save-GitHoundCheckpoint {
         The output folder where the checkpoint file will be saved.
 
     .PARAMETER Checkpoint
-        A hashtable containing checkpoint data (completedPhases, parameters, etc.).
+        A hashtable containing checkpoint data (completedPhases, parameters, phaseProgress, etc.).
+        Version 2 checkpoints include phaseProgress for incremental checkpointing within phases.
     #>
     Param(
         [Parameter(Mandatory = $true)]
@@ -675,8 +676,13 @@ function Save-GitHoundCheckpoint {
         [hashtable]$Checkpoint
     )
 
+    # Ensure version is set for v2 checkpoints
+    if (-not $Checkpoint.ContainsKey('version')) {
+        $Checkpoint['version'] = 2
+    }
+
     $checkpointPath = Join-Path -Path $OutputFolder -ChildPath "_checkpoint.json"
-    $Checkpoint | ConvertTo-Json -Depth 5 | Out-File -FilePath $checkpointPath -Force
+    $Checkpoint | ConvertTo-Json -Depth 10 | Out-File -FilePath $checkpointPath -Force
 }
 
 function Get-GitHoundCheckpoint {
@@ -689,6 +695,7 @@ function Get-GitHoundCheckpoint {
 
     .OUTPUTS
         Returns the checkpoint hashtable, or $null if no checkpoint exists.
+        Version 2 checkpoints include phaseProgress for incremental resume within phases.
     #>
     Param(
         [Parameter(Mandatory = $true)]
@@ -698,8 +705,13 @@ function Get-GitHoundCheckpoint {
     $checkpointPath = Join-Path -Path $OutputFolder -ChildPath "_checkpoint.json"
     if (Test-Path $checkpointPath) {
         $checkpoint = Get-Content -Path $checkpointPath -Raw | ConvertFrom-Json
+
+        # Determine checkpoint version (v1 has no version field)
+        $checkpointVersion = if ($checkpoint.version) { $checkpoint.version } else { 1 }
+
         # Convert PSCustomObject to hashtable
         $result = @{
+            version = $checkpointVersion
             timestamp = $checkpoint.timestamp
             orgId = $checkpoint.orgId
             completedPhases = @($checkpoint.completedPhases)
@@ -708,7 +720,31 @@ function Get-GitHoundCheckpoint {
             repoFilter = $checkpoint.repoFilter
             repoVisibility = $checkpoint.repoVisibility
             throttleLimit = $checkpoint.throttleLimit
+            checkpointBatchSize = if ($checkpoint.checkpointBatchSize) { $checkpoint.checkpointBatchSize } else { 100 }
         }
+
+        # Handle phaseProgress based on version
+        if ($checkpointVersion -eq 1) {
+            # V1 checkpoint - no phaseProgress (existing behavior)
+            $result.phaseProgress = @{}
+        } else {
+            # V2+ checkpoint - has phaseProgress
+            if ($checkpoint.phaseProgress) {
+                # Convert PSCustomObject to hashtable recursively
+                $result.phaseProgress = @{}
+                foreach ($prop in $checkpoint.phaseProgress.PSObject.Properties) {
+                    $phaseData = @{
+                        status = $prop.Value.status
+                        processedItemIds = @($prop.Value.processedItemIds)
+                        totalItems = $prop.Value.totalItems
+                    }
+                    $result.phaseProgress[$prop.Name] = $phaseData
+                }
+            } else {
+                $result.phaseProgress = @{}
+            }
+        }
+
         return $result
     }
     return $null
@@ -749,6 +785,300 @@ function Read-GitHoundPhaseData {
     } catch {
         Write-Warning "Failed to read phase file: $FilePath - $_"
         return $null
+    }
+}
+
+function Write-GitHoundIncrementalData {
+    <#
+    .SYNOPSIS
+        Appends batch of nodes/edges to an incremental JSONL file for checkpoint recovery.
+
+    .DESCRIPTION
+        Writes incremental collection data in JSONL format (one JSON object per line).
+        Each line contains type (node/edge), itemId, and data.
+        This allows partial recovery if collection is interrupted mid-phase.
+
+    .PARAMETER OutputPath
+        The output folder path.
+
+    .PARAMETER PhaseName
+        The name of the current phase (e.g., 'branches', 'workflows').
+
+    .PARAMETER Nodes
+        Array of node objects to append.
+
+    .PARAMETER Edges
+        Array of edge objects to append.
+
+    .PARAMETER ProcessedItemIds
+        Array of item IDs that were processed in this batch (for checkpoint tracking).
+    #>
+    Param(
+        [Parameter(Mandatory = $true)]
+        [string]$OutputPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PhaseName,
+
+        [Parameter(Mandatory = $false)]
+        [object[]]$Nodes = @(),
+
+        [Parameter(Mandatory = $false)]
+        [object[]]$Edges = @(),
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$ProcessedItemIds = @()
+    )
+
+    $incrementalFile = Join-Path -Path $OutputPath -ChildPath "_${PhaseName}_incremental.jsonl"
+
+    $lines = New-Object System.Collections.ArrayList
+
+    # Write nodes
+    foreach ($node in $Nodes) {
+        $line = @{
+            type = 'node'
+            data = $node
+        } | ConvertTo-Json -Compress -Depth 10
+        $null = $lines.Add($line)
+    }
+
+    # Write edges
+    foreach ($edge in $Edges) {
+        $line = @{
+            type = 'edge'
+            data = $edge
+        } | ConvertTo-Json -Compress -Depth 10
+        $null = $lines.Add($line)
+    }
+
+    # Append to file
+    if ($lines.Count -gt 0) {
+        $lines | Out-File -FilePath $incrementalFile -Append -Encoding utf8
+    }
+}
+
+function Read-GitHoundIncrementalData {
+    <#
+    .SYNOPSIS
+        Reads nodes and edges from an incremental JSONL file.
+
+    .DESCRIPTION
+        Parses the JSONL format incremental file and returns nodes and edges
+        for merging with newly collected data.
+
+    .PARAMETER FilePath
+        The path to the incremental JSONL file.
+
+    .OUTPUTS
+        Returns a PSCustomObject with Nodes and Edges arrays.
+    #>
+    Param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath
+    )
+
+    $nodes = New-Object System.Collections.ArrayList
+    $edges = New-Object System.Collections.ArrayList
+
+    if (-not (Test-Path $FilePath)) {
+        return [PSCustomObject]@{
+            Nodes = @()
+            Edges = @()
+        }
+    }
+
+    try {
+        $lines = Get-Content -Path $FilePath -Encoding utf8
+        foreach ($line in $lines) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $obj = $line | ConvertFrom-Json
+            if ($obj.type -eq 'node') {
+                $null = $nodes.Add($obj.data)
+            } elseif ($obj.type -eq 'edge') {
+                $null = $edges.Add($obj.data)
+            }
+        }
+    } catch {
+        Write-Warning "Failed to read incremental file: $FilePath - $_"
+    }
+
+    return [PSCustomObject]@{
+        Nodes = $nodes.ToArray()
+        Edges = $edges.ToArray()
+    }
+}
+
+function Split-ArrayIntoBatches {
+    <#
+    .SYNOPSIS
+        Splits an array into batches of specified size.
+
+    .PARAMETER Array
+        The array to split.
+
+    .PARAMETER BatchSize
+        The maximum size of each batch.
+
+    .OUTPUTS
+        Returns an array of arrays, each containing up to BatchSize items.
+    #>
+    Param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Array,
+
+        [Parameter(Mandatory = $true)]
+        [int]$BatchSize
+    )
+
+    if ($BatchSize -le 0) {
+        return @(,$Array)
+    }
+
+    $batches = New-Object System.Collections.ArrayList
+    for ($i = 0; $i -lt $Array.Count; $i += $BatchSize) {
+        $end = [Math]::Min($i + $BatchSize, $Array.Count)
+        $batch = $Array[$i..($end - 1)]
+        $null = $batches.Add($batch)
+    }
+
+    return $batches.ToArray()
+}
+
+function Invoke-GitHoundBatchedCollection {
+    <#
+    .SYNOPSIS
+        Wraps parallel collection with batch-based checkpointing.
+
+    .DESCRIPTION
+        Splits items into batches, processes each batch, writes incremental data
+        after each batch, and updates checkpoint. Maintains parallel processing
+        performance while enabling resume from the exact point of interruption.
+
+    .PARAMETER Items
+        Array of items to process (repos, teams, etc.).
+
+    .PARAMETER ItemIdProperty
+        Property name for the item ID (e.g., 'id', 'node_id').
+
+    .PARAMETER ProcessBatch
+        ScriptBlock containing the collection logic. Receives $Items parameter.
+
+    .PARAMETER PhaseName
+        Name of the current phase for checkpoint tracking.
+
+    .PARAMETER OutputFolder
+        Output folder path for incremental files.
+
+    .PARAMETER BatchSize
+        Number of items per batch. 0 = process all at once (no incremental).
+
+    .PARAMETER SkipItemIds
+        Array of item IDs already processed (from checkpoint).
+
+    .PARAMETER SaveCheckpointFunc
+        ScriptBlock to call for saving checkpoint after each batch.
+
+    .PARAMETER PhaseProgressRef
+        Reference to the phase progress hashtable to update.
+
+    .OUTPUTS
+        Returns a PSCustomObject with Nodes and Edges arrays.
+    #>
+    Param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Items,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ItemIdProperty,
+
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$ProcessBatch,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PhaseName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputFolder,
+
+        [Parameter(Mandatory = $true)]
+        [int]$BatchSize,
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$SkipItemIds = @(),
+
+        [Parameter(Mandatory = $false)]
+        [scriptblock]$SaveCheckpointFunc = $null,
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$PhaseProgressRef = $null
+    )
+
+    # Filter out already-processed items
+    $remainingItems = @($Items | Where-Object {
+        $itemId = $_.$ItemIdProperty
+        $SkipItemIds -notcontains $itemId
+    })
+
+    Write-Verbose "Batched collection: $($Items.Count) total, $($SkipItemIds.Count) skipped, $($remainingItems.Count) remaining"
+
+    if ($BatchSize -eq 0 -or $BatchSize -lt 0) {
+        # No batching - process all at once (original behavior)
+        if ($remainingItems.Count -eq 0) {
+            return [PSCustomObject]@{
+                Nodes = @()
+                Edges = @()
+            }
+        }
+        $result = & $ProcessBatch -Items $remainingItems
+        return $result
+    }
+
+    # Process in batches
+    $allNodes = New-Object System.Collections.ArrayList
+    $allEdges = New-Object System.Collections.ArrayList
+    $batches = Split-ArrayIntoBatches -Array $remainingItems -BatchSize $BatchSize
+
+    $batchNum = 0
+    $totalBatches = $batches.Count
+    foreach ($batch in $batches) {
+        $batchNum++
+
+        # Process batch (parallel processing happens inside $ProcessBatch)
+        $batchResult = & $ProcessBatch -Items $batch
+
+        # Accumulate results
+        if ($batchResult.Nodes) {
+            $null = $allNodes.AddRange(@($batchResult.Nodes))
+        }
+        if ($batchResult.Edges) {
+            $null = $allEdges.AddRange(@($batchResult.Edges))
+        }
+
+        # Get batch item IDs
+        $batchItemIds = @($batch | ForEach-Object { $_.$ItemIdProperty })
+
+        # Write incremental data
+        Write-GitHoundIncrementalData -OutputPath $OutputFolder -PhaseName $PhaseName `
+            -Nodes @($batchResult.Nodes) -Edges @($batchResult.Edges) -ProcessedItemIds $batchItemIds
+
+        # Update phase progress
+        if ($PhaseProgressRef) {
+            $PhaseProgressRef.processedItemIds = @($PhaseProgressRef.processedItemIds) + $batchItemIds
+        }
+
+        # Save checkpoint
+        if ($SaveCheckpointFunc) {
+            & $SaveCheckpointFunc
+        }
+
+        $totalProcessed = $SkipItemIds.Count + $allNodes.Count
+        Write-Host "[*] $PhaseName`: Batch $batchNum/$totalBatches complete ($($batchItemIds.Count) items, $totalProcessed total processed)"
+    }
+
+    return [PSCustomObject]@{
+        Nodes = $allNodes.ToArray()
+        Edges = $allEdges.ToArray()
     }
 }
 
@@ -2931,6 +3261,15 @@ function Invoke-GitHound
     .PARAMETER Resume
         Path to an existing output folder from a previous run to resume collection.
         Completed phases will be skipped and collection continues from where it left off.
+        With incremental checkpointing (v2), in-progress phases resume from the exact item.
+
+    .PARAMETER CheckpointBatchSize
+        Number of items to process before saving an incremental checkpoint. Defaults to 100.
+        Set to 0 to disable incremental checkpointing (original behavior).
+        - 0: Disable incremental checkpoints (fastest, for small orgs or reliable connections)
+        - 50: Frequent checkpoints (for rate-limited environments)
+        - 100: Default, good balance for most scenarios
+        - 500: Less frequent (faster, for large orgs with reliable connections)
 
     .EXAMPLE
         $session = New-GithubSession -OrganizationName "my-org" -Token $token
@@ -2938,6 +3277,14 @@ function Invoke-GitHound
 
     .EXAMPLE
         Invoke-GitHound -Session $session -Collect @('Users', 'Repos', 'Branches') -RepoFilter 'api-*'
+
+    .EXAMPLE
+        # Disable incremental checkpointing for small orgs
+        Invoke-GitHound -Session $session -CheckpointBatchSize 0
+
+    .EXAMPLE
+        # Frequent checkpoints for rate-limited environments
+        Invoke-GitHound -Session $session -CheckpointBatchSize 50
 
     .EXAMPLE
         Invoke-GitHound -Session $session -Collect @('Branches') -OutputPath './output/'
@@ -2981,11 +3328,16 @@ function Invoke-GitHound
         [switch]$Zip,
 
         [Parameter(Mandatory = $false)]
-        [string]$Resume = ''
+        [string]$Resume = '',
+
+        [Parameter(Mandatory = $false)]
+        [int]$CheckpointBatchSize = 100
     )
 
     # Track completed phases for checkpoint/resume
     $completedPhases = @()
+    # Store phaseProgress from checkpoint to merge after initialization
+    $resumePhaseProgress = $null
 
     # Handle resume from previous run
     if ($Resume -ne '') {
@@ -3011,6 +3363,16 @@ function Invoke-GitHound
         $RepoVisibility = $checkpoint.repoVisibility
         $ThrottleLimit = $checkpoint.throttleLimit
         $completedPhases = @($checkpoint.completedPhases)
+        $CheckpointBatchSize = $checkpoint.checkpointBatchSize
+        $resumePhaseProgress = $checkpoint.phaseProgress
+
+        # Report in-progress phases from checkpoint
+        if ($resumePhaseProgress -and $resumePhaseProgress.Count -gt 0) {
+            foreach ($phaseName in $resumePhaseProgress.Keys) {
+                $progress = $resumePhaseProgress[$phaseName]
+                Write-Host "[*] In-progress phase '$phaseName': $($progress.processedItemIds.Count)/$($progress.totalItems) items processed"
+            }
+        }
 
         # Skip the 'All' resolution since we restored the explicit phases
     } else {
@@ -3069,9 +3431,18 @@ function Invoke-GitHound
         Write-Host "[*] Resuming in folder: $outputFolder"
     }
 
+    # Initialize phase progress tracking for incremental checkpointing
+    # Merge with resumed phaseProgress if available
+    if ($resumePhaseProgress -and $resumePhaseProgress.Count -gt 0) {
+        $phaseProgress = $resumePhaseProgress
+    } else {
+        $phaseProgress = @{}
+    }
+
     # Helper function to save checkpoint
     function Save-Checkpoint {
         $checkpointData = @{
+            version = 2
             timestamp = $timestamp
             orgId = $orgId
             completedPhases = $completedPhases
@@ -3080,6 +3451,8 @@ function Invoke-GitHound
             repoFilter = $RepoFilter
             repoVisibility = $RepoVisibility
             throttleLimit = $ThrottleLimit
+            checkpointBatchSize = $CheckpointBatchSize
+            phaseProgress = $phaseProgress
         }
         Save-GitHoundCheckpoint -OutputFolder $outputFolder -Checkpoint $checkpointData
     }
@@ -3240,19 +3613,72 @@ function Invoke-GitHound
     if ($Collect -contains 'Branches' -and $repos) {
         if ($completedPhases -notcontains 'branches') {
             Write-Host "[*] Enumerating Organization Branches"
-            $branches = $repos | Git-HoundBranch -Session $Session -ThrottleLimit $ThrottleLimit
 
+            # Load existing progress if resuming mid-phase
+            $skipItemIds = @()
+            $existingIncrementalData = $null
+            $incrementalFile = Join-Path $outputFolder "_branches_incremental.jsonl"
+            if ($phaseProgress.branches) {
+                $skipItemIds = @($phaseProgress.branches.processedItemIds)
+                if (Test-Path $incrementalFile) {
+                    $existingIncrementalData = Read-GitHoundIncrementalData -FilePath $incrementalFile
+                }
+                Write-Host "[*] Resuming: $($skipItemIds.Count) repos already processed"
+            }
+
+            # Initialize phase progress if not resuming
+            if (-not $phaseProgress.branches) {
+                $phaseProgress.branches = @{
+                    status = 'in_progress'
+                    processedItemIds = @()
+                    totalItems = $repos.nodes.Count
+                }
+            }
+
+            # Collect branches with batching support
+            if ($CheckpointBatchSize -gt 0) {
+                $branchResult = Invoke-GitHoundBatchedCollection `
+                    -Items @($repos.nodes) `
+                    -ItemIdProperty 'id' `
+                    -ProcessBatch {
+                        param($Items)
+                        $batchRepos = [PSCustomObject]@{ nodes = $Items }
+                        $batchRepos | Git-HoundBranch -Session $Session -ThrottleLimit $ThrottleLimit
+                    } `
+                    -PhaseName 'branches' `
+                    -OutputFolder $outputFolder `
+                    -BatchSize $CheckpointBatchSize `
+                    -SkipItemIds $skipItemIds `
+                    -SaveCheckpointFunc { Save-Checkpoint } `
+                    -PhaseProgressRef $phaseProgress.branches
+            } else {
+                # No batching - original behavior
+                $branchResult = $repos | Git-HoundBranch -Session $Session -ThrottleLimit $ThrottleLimit
+            }
+
+            # Merge with existing incremental data if resuming
             $branchNodes = New-Object System.Collections.ArrayList
             $branchEdges = New-Object System.Collections.ArrayList
-            if ($branches.nodes) { $null = $branchNodes.AddRange(@($branches.nodes)) }
-            if ($branches.edges) { $null = $branchEdges.AddRange(@($branches.edges)) }
+            if ($existingIncrementalData) {
+                if ($existingIncrementalData.Nodes) { $null = $branchNodes.AddRange(@($existingIncrementalData.Nodes)) }
+                if ($existingIncrementalData.Edges) { $null = $branchEdges.AddRange(@($existingIncrementalData.Edges)) }
+            }
+            if ($branchResult.nodes) { $null = $branchNodes.AddRange(@($branchResult.nodes)) }
+            if ($branchResult.edges) { $null = $branchEdges.AddRange(@($branchResult.edges)) }
+            # Handle both .Nodes and .nodes property names
+            if ($branchResult.Nodes) { $null = $branchNodes.AddRange(@($branchResult.Nodes)) }
+            if ($branchResult.Edges) { $null = $branchEdges.AddRange(@($branchResult.Edges)) }
 
             $branchFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
                 -PhaseName 'branches' -Tier 2 -Nodes $branchNodes -Edges $branchEdges
             $null = $writtenFiles.Add(@{ File = $branchFile; Tier = 2; Phase = 'branches' })
 
-            if ($branches.nodes) { $null = $allNodes.AddRange(@($branches.nodes)) }
-            if ($branches.edges) { $null = $allEdges.AddRange(@($branches.edges)) }
+            if ($branchNodes.Count -gt 0) { $null = $allNodes.AddRange($branchNodes) }
+            if ($branchEdges.Count -gt 0) { $null = $allEdges.AddRange($branchEdges) }
+
+            # Cleanup incremental file and phase progress
+            if (Test-Path $incrementalFile) { Remove-Item $incrementalFile -Force }
+            $phaseProgress.Remove('branches')
 
             $completedPhases += 'branches'
             Save-Checkpoint
@@ -3275,19 +3701,71 @@ function Invoke-GitHound
     if ($Collect -contains 'Workflows' -and $repos) {
         if ($completedPhases -notcontains 'workflows') {
             Write-Host "[*] Enumerating Organization Workflows"
-            $workflows = $repos | Git-HoundWorkflow -Session $Session -ThrottleLimit $ThrottleLimit
 
+            # Load existing progress if resuming mid-phase
+            $skipItemIds = @()
+            $existingIncrementalData = $null
+            $incrementalFile = Join-Path $outputFolder "_workflows_incremental.jsonl"
+            if ($phaseProgress.workflows) {
+                $skipItemIds = @($phaseProgress.workflows.processedItemIds)
+                if (Test-Path $incrementalFile) {
+                    $existingIncrementalData = Read-GitHoundIncrementalData -FilePath $incrementalFile
+                }
+                Write-Host "[*] Resuming: $($skipItemIds.Count) repos already processed"
+            }
+
+            # Initialize phase progress if not resuming
+            if (-not $phaseProgress.workflows) {
+                $phaseProgress.workflows = @{
+                    status = 'in_progress'
+                    processedItemIds = @()
+                    totalItems = $repos.nodes.Count
+                }
+            }
+
+            # Collect workflows with batching support
+            if ($CheckpointBatchSize -gt 0) {
+                $workflowResult = Invoke-GitHoundBatchedCollection `
+                    -Items @($repos.nodes) `
+                    -ItemIdProperty 'id' `
+                    -ProcessBatch {
+                        param($Items)
+                        $batchRepos = [PSCustomObject]@{ nodes = $Items }
+                        $batchRepos | Git-HoundWorkflow -Session $Session -ThrottleLimit $ThrottleLimit
+                    } `
+                    -PhaseName 'workflows' `
+                    -OutputFolder $outputFolder `
+                    -BatchSize $CheckpointBatchSize `
+                    -SkipItemIds $skipItemIds `
+                    -SaveCheckpointFunc { Save-Checkpoint } `
+                    -PhaseProgressRef $phaseProgress.workflows
+            } else {
+                # No batching - original behavior
+                $workflowResult = $repos | Git-HoundWorkflow -Session $Session -ThrottleLimit $ThrottleLimit
+            }
+
+            # Merge with existing incremental data if resuming
             $workflowNodes = New-Object System.Collections.ArrayList
             $workflowEdges = New-Object System.Collections.ArrayList
-            if ($workflows.nodes) { $null = $workflowNodes.AddRange(@($workflows.nodes)) }
-            if ($workflows.edges) { $null = $workflowEdges.AddRange(@($workflows.edges)) }
+            if ($existingIncrementalData) {
+                if ($existingIncrementalData.Nodes) { $null = $workflowNodes.AddRange(@($existingIncrementalData.Nodes)) }
+                if ($existingIncrementalData.Edges) { $null = $workflowEdges.AddRange(@($existingIncrementalData.Edges)) }
+            }
+            if ($workflowResult.nodes) { $null = $workflowNodes.AddRange(@($workflowResult.nodes)) }
+            if ($workflowResult.edges) { $null = $workflowEdges.AddRange(@($workflowResult.edges)) }
+            if ($workflowResult.Nodes) { $null = $workflowNodes.AddRange(@($workflowResult.Nodes)) }
+            if ($workflowResult.Edges) { $null = $workflowEdges.AddRange(@($workflowResult.Edges)) }
 
             $workflowFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
                 -PhaseName 'workflows' -Tier 2 -Nodes $workflowNodes -Edges $workflowEdges
             $null = $writtenFiles.Add(@{ File = $workflowFile; Tier = 2; Phase = 'workflows' })
 
-            if ($workflows.nodes) { $null = $allNodes.AddRange(@($workflows.nodes)) }
-            if ($workflows.edges) { $null = $allEdges.AddRange(@($workflows.edges)) }
+            if ($workflowNodes.Count -gt 0) { $null = $allNodes.AddRange($workflowNodes) }
+            if ($workflowEdges.Count -gt 0) { $null = $allEdges.AddRange($workflowEdges) }
+
+            # Cleanup incremental file and phase progress
+            if (Test-Path $incrementalFile) { Remove-Item $incrementalFile -Force }
+            $phaseProgress.Remove('workflows')
 
             $completedPhases += 'workflows'
             Save-Checkpoint
@@ -3310,19 +3788,71 @@ function Invoke-GitHound
     if ($Collect -contains 'Environments' -and $repos) {
         if ($completedPhases -notcontains 'environments') {
             Write-Host "[*] Enumerating Organization Environments"
-            $environments = $repos | Git-HoundEnvironment -Session $Session -ThrottleLimit $ThrottleLimit
 
+            # Load existing progress if resuming mid-phase
+            $skipItemIds = @()
+            $existingIncrementalData = $null
+            $incrementalFile = Join-Path $outputFolder "_environments_incremental.jsonl"
+            if ($phaseProgress.environments) {
+                $skipItemIds = @($phaseProgress.environments.processedItemIds)
+                if (Test-Path $incrementalFile) {
+                    $existingIncrementalData = Read-GitHoundIncrementalData -FilePath $incrementalFile
+                }
+                Write-Host "[*] Resuming: $($skipItemIds.Count) repos already processed"
+            }
+
+            # Initialize phase progress if not resuming
+            if (-not $phaseProgress.environments) {
+                $phaseProgress.environments = @{
+                    status = 'in_progress'
+                    processedItemIds = @()
+                    totalItems = $repos.nodes.Count
+                }
+            }
+
+            # Collect environments with batching support
+            if ($CheckpointBatchSize -gt 0) {
+                $envResult = Invoke-GitHoundBatchedCollection `
+                    -Items @($repos.nodes) `
+                    -ItemIdProperty 'id' `
+                    -ProcessBatch {
+                        param($Items)
+                        $batchRepos = [PSCustomObject]@{ nodes = $Items }
+                        $batchRepos | Git-HoundEnvironment -Session $Session -ThrottleLimit $ThrottleLimit
+                    } `
+                    -PhaseName 'environments' `
+                    -OutputFolder $outputFolder `
+                    -BatchSize $CheckpointBatchSize `
+                    -SkipItemIds $skipItemIds `
+                    -SaveCheckpointFunc { Save-Checkpoint } `
+                    -PhaseProgressRef $phaseProgress.environments
+            } else {
+                # No batching - original behavior
+                $envResult = $repos | Git-HoundEnvironment -Session $Session -ThrottleLimit $ThrottleLimit
+            }
+
+            # Merge with existing incremental data if resuming
             $envNodes = New-Object System.Collections.ArrayList
             $envEdges = New-Object System.Collections.ArrayList
-            if ($environments.nodes) { $null = $envNodes.AddRange(@($environments.nodes)) }
-            if ($environments.edges) { $null = $envEdges.AddRange(@($environments.edges)) }
+            if ($existingIncrementalData) {
+                if ($existingIncrementalData.Nodes) { $null = $envNodes.AddRange(@($existingIncrementalData.Nodes)) }
+                if ($existingIncrementalData.Edges) { $null = $envEdges.AddRange(@($existingIncrementalData.Edges)) }
+            }
+            if ($envResult.nodes) { $null = $envNodes.AddRange(@($envResult.nodes)) }
+            if ($envResult.edges) { $null = $envEdges.AddRange(@($envResult.edges)) }
+            if ($envResult.Nodes) { $null = $envNodes.AddRange(@($envResult.Nodes)) }
+            if ($envResult.Edges) { $null = $envEdges.AddRange(@($envResult.Edges)) }
 
             $envFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
                 -PhaseName 'environments' -Tier 2 -Nodes $envNodes -Edges $envEdges
             $null = $writtenFiles.Add(@{ File = $envFile; Tier = 2; Phase = 'environments' })
 
-            if ($environments.nodes) { $null = $allNodes.AddRange(@($environments.nodes)) }
-            if ($environments.edges) { $null = $allEdges.AddRange(@($environments.edges)) }
+            if ($envNodes.Count -gt 0) { $null = $allNodes.AddRange($envNodes) }
+            if ($envEdges.Count -gt 0) { $null = $allEdges.AddRange($envEdges) }
+
+            # Cleanup incremental file and phase progress
+            if (Test-Path $incrementalFile) { Remove-Item $incrementalFile -Force }
+            $phaseProgress.Remove('environments')
 
             $completedPhases += 'environments'
             Save-Checkpoint
@@ -3345,19 +3875,71 @@ function Invoke-GitHound
     if ($Collect -contains 'Secrets' -and $repos) {
         if ($completedPhases -notcontains 'secrets') {
             Write-Host "[*] Enumerating Organization Secrets"
-            $secrets = $repos | Git-HoundSecret -Session $Session -ThrottleLimit $ThrottleLimit
 
+            # Load existing progress if resuming mid-phase
+            $skipItemIds = @()
+            $existingIncrementalData = $null
+            $incrementalFile = Join-Path $outputFolder "_secrets_incremental.jsonl"
+            if ($phaseProgress.secrets) {
+                $skipItemIds = @($phaseProgress.secrets.processedItemIds)
+                if (Test-Path $incrementalFile) {
+                    $existingIncrementalData = Read-GitHoundIncrementalData -FilePath $incrementalFile
+                }
+                Write-Host "[*] Resuming: $($skipItemIds.Count) repos already processed"
+            }
+
+            # Initialize phase progress if not resuming
+            if (-not $phaseProgress.secrets) {
+                $phaseProgress.secrets = @{
+                    status = 'in_progress'
+                    processedItemIds = @()
+                    totalItems = $repos.nodes.Count
+                }
+            }
+
+            # Collect secrets with batching support
+            if ($CheckpointBatchSize -gt 0) {
+                $secretResult = Invoke-GitHoundBatchedCollection `
+                    -Items @($repos.nodes) `
+                    -ItemIdProperty 'id' `
+                    -ProcessBatch {
+                        param($Items)
+                        $batchRepos = [PSCustomObject]@{ nodes = $Items }
+                        $batchRepos | Git-HoundSecret -Session $Session -ThrottleLimit $ThrottleLimit
+                    } `
+                    -PhaseName 'secrets' `
+                    -OutputFolder $outputFolder `
+                    -BatchSize $CheckpointBatchSize `
+                    -SkipItemIds $skipItemIds `
+                    -SaveCheckpointFunc { Save-Checkpoint } `
+                    -PhaseProgressRef $phaseProgress.secrets
+            } else {
+                # No batching - original behavior
+                $secretResult = $repos | Git-HoundSecret -Session $Session -ThrottleLimit $ThrottleLimit
+            }
+
+            # Merge with existing incremental data if resuming
             $secretNodes = New-Object System.Collections.ArrayList
             $secretEdges = New-Object System.Collections.ArrayList
-            if ($secrets.nodes) { $null = $secretNodes.AddRange(@($secrets.nodes)) }
-            if ($secrets.edges) { $null = $secretEdges.AddRange(@($secrets.edges)) }
+            if ($existingIncrementalData) {
+                if ($existingIncrementalData.Nodes) { $null = $secretNodes.AddRange(@($existingIncrementalData.Nodes)) }
+                if ($existingIncrementalData.Edges) { $null = $secretEdges.AddRange(@($existingIncrementalData.Edges)) }
+            }
+            if ($secretResult.nodes) { $null = $secretNodes.AddRange(@($secretResult.nodes)) }
+            if ($secretResult.edges) { $null = $secretEdges.AddRange(@($secretResult.edges)) }
+            if ($secretResult.Nodes) { $null = $secretNodes.AddRange(@($secretResult.Nodes)) }
+            if ($secretResult.Edges) { $null = $secretEdges.AddRange(@($secretResult.Edges)) }
 
             $secretFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
                 -PhaseName 'secrets' -Tier 2 -Nodes $secretNodes -Edges $secretEdges
             $null = $writtenFiles.Add(@{ File = $secretFile; Tier = 2; Phase = 'secrets' })
 
-            if ($secrets.nodes) { $null = $allNodes.AddRange(@($secrets.nodes)) }
-            if ($secrets.edges) { $null = $allEdges.AddRange(@($secrets.edges)) }
+            if ($secretNodes.Count -gt 0) { $null = $allNodes.AddRange($secretNodes) }
+            if ($secretEdges.Count -gt 0) { $null = $allEdges.AddRange($secretEdges) }
+
+            # Cleanup incremental file and phase progress
+            if (Test-Path $incrementalFile) { Remove-Item $incrementalFile -Force }
+            $phaseProgress.Remove('secrets')
 
             $completedPhases += 'secrets'
             Save-Checkpoint
@@ -3666,12 +4248,19 @@ function Invoke-GitHound
     Write-Host "============================================="
 
     # ===========================================
-    # Cleanup checkpoint (collection complete)
+    # Cleanup checkpoint and incremental files (collection complete)
     # ===========================================
     $checkpointPath = Join-Path -Path $outputFolder -ChildPath "_checkpoint.json"
     if (Test-Path $checkpointPath) {
         Remove-Item -Path $checkpointPath -Force
         Write-Host "[*] Checkpoint file removed (collection complete)"
+    }
+
+    # Clean up any remaining incremental files
+    $incrementalFiles = Get-ChildItem -Path $outputFolder -Filter "_*_incremental.jsonl" -ErrorAction SilentlyContinue
+    foreach ($file in $incrementalFiles) {
+        Remove-Item -Path $file.FullName -Force
+        Write-Host "[*] Cleaned up incremental file: $($file.Name)"
     }
 
     # ===========================================
