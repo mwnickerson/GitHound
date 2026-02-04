@@ -109,7 +109,7 @@ For large organizations that may hit rate limits with personal access tokens, yo
 2. **Install the App** in your organization:
    - Go to your GitHub App settings → Install App
    - Select your organization and authorize access
-   - Note the **Installation ID** from the URL (e.g., `https://github.com/settings/installations/12345678` → Installation ID is `12345678`)
+   - Note the **App Installation ID** from the URL (e.g., `https://github.com/settings/installations/12345678` → App ID is `12345678`)
 
 #### Creating a Session with GitHub App JWT
 
@@ -118,7 +118,7 @@ $session = New-GitHubJwtSession `
     -OrganizationName "your-org" `
     -ClientId "Iv1.abc123def456" `
     -PrivateKeyPath "./path/to/private-key.pem" `
-    -AppInstallationId "12345678"
+    -AppId "12345678"
 ```
 
 Then run the collection as normal:
