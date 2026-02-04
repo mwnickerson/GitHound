@@ -194,12 +194,41 @@ Invoke-GitHound -Session $session -OutputPath './collection/'
 Invoke-GitHound -Session $session -Zip
 ```
 
-#### Resume
-Due to GitHUb rate limiting large organizations may hit a rate limit. The collector sleeps and resumes, but in case it fails there is a resume function.
+#### Resume & Checkpointing
+Due to GitHub rate limiting, large organizations may hit rate limits during collection. The collector sleeps and resumes automatically, but if it fails or is interrupted (Ctrl+C), you can resume from where it left off.
+
 `-Resume` - Resumes from an interrupted state
 ```PowerShell
 Invoke-GitHound -Session $session -Resume './20240202180026_O_abcdefghi/'
 ```
+
+`-CheckpointBatchSize` - Controls how frequently progress is saved during collection (default: 100)
+
+The collector now supports **incremental checkpointing** which saves progress within each phase, not just between phases. This is critical for very large organizations (50,000+ repos) where a single phase could take hours.
+
+| Value | Behavior | Use Case |
+|-------|----------|----------|
+| `0` | Disable incremental checkpoints | Small orgs, fast/reliable connections |
+| `50` | Checkpoint every 50 items | Rate-limited environments, unreliable connections |
+| `100` | Default - good balance | Most scenarios |
+| `500` | Checkpoint every 500 items | Large orgs with reliable connections |
+
+**Frequent checkpoints for rate-limited environments:**
+```PowerShell
+Invoke-GitHound -Session $session -CheckpointBatchSize 50
+```
+
+**Disable incremental checkpoints (original behavior):**
+```PowerShell
+Invoke-GitHound -Session $session -CheckpointBatchSize 0
+```
+
+**How it works:**
+- **Tier 1 phases** (Users, Teams, Repos): Checkpoints after each page of API results
+- **Tier 2 phases** (Branches, Workflows, Environments, Secrets): Checkpoints after processing each batch of repositories
+- Progress is saved to `_checkpoint.json` and `_<phase>_incremental.jsonl` files
+- On resume, collection continues from the exact page/batch where it stopped
+- Incremental files are automatically cleaned up when each phase completes
 
 ### Sample
 
