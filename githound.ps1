@@ -86,6 +86,103 @@ function New-GithubSession {
     }
 }
 
+# Reference: https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app
+function New-GitHubJwtSession {
+    <#
+    .SYNOPSIS
+        Creates a GitHub session using GitHub App JWT authentication.
+
+    .DESCRIPTION
+        Generates a JWT from GitHub App credentials and exchanges it for an Installation Access Token,
+        which provides higher rate limits than personal access tokens.
+
+    .PARAMETER OrganizationName
+        The name of the GitHub organization.
+
+    .PARAMETER ClientId
+        The Client ID of the GitHub App (used as JWT issuer).
+
+    .PARAMETER PrivateKeyPath
+        Path to the PEM file containing the GitHub App's private key.
+
+    .PARAMETER AppInstallationId
+        The Installation ID of the GitHub App for the target organization.
+        Find this in your org's GitHub App installation settings URL.
+
+    .EXAMPLE
+        $session = New-GitHubJwtSession -OrganizationName "my-org" -ClientId "Iv1.abc123" -PrivateKeyPath "./private-key.pem" -AppInstallationId "12345678"
+    #>
+    [OutputType('GitHound.Session')]
+    [CmdletBinding()]
+    Param(
+        [Parameter(Position=0, Mandatory = $true)]
+        [string]
+        $OrganizationName,
+
+        [Parameter(Position=1, Mandatory = $true)]
+        [string]
+        $ClientId,
+
+        [Parameter(Position=2, Mandatory = $true)]
+        [string]
+        $PrivateKeyPath,
+
+        [Parameter(Position=3, Mandatory = $true)]
+        [string]
+        $AppInstallationId
+    )
+
+    # Validate private key file exists
+    if (-not (Test-Path $PrivateKeyPath)) {
+        throw "Private key file not found at path: $PrivateKeyPath"
+    }
+
+    # Create JWT header (Base64URL encoded)
+    $header = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject @{
+        alg = "RS256"
+        typ = "JWT"
+    }))).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+
+    # Create JWT payload with issued-at (backdated 10s for clock skew) and expiration (10 min)
+    $payload = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject @{
+        iat = [System.DateTimeOffset]::UtcNow.AddSeconds(-10).ToUnixTimeSeconds()
+        exp = [System.DateTimeOffset]::UtcNow.AddMinutes(10).ToUnixTimeSeconds()
+        iss = $ClientId
+    }))).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+
+    # Sign the JWT with RSA private key
+    $rsa = [System.Security.Cryptography.RSA]::Create()
+    $rsa.ImportFromPem((Get-Content $PrivateKeyPath -Raw))
+
+    $signature = [Convert]::ToBase64String(
+        $rsa.SignData(
+            [System.Text.Encoding]::UTF8.GetBytes("$header.$payload"),
+            [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+            [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
+        )
+    ).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+
+    $jwt = "$header.$payload.$signature"
+
+    # Create temporary session with JWT to request installation access token
+    $jwtSession = New-GithubSession -OrganizationName $OrganizationName -Token $jwt
+
+    # Request installation access token
+    Write-Verbose "Requesting installation access token for App Installation ID: $AppInstallationId"
+    $result = Invoke-GithubRestMethod -Session $jwtSession -Path "app/installations/$($AppInstallationId)/access_tokens" -Method POST
+
+    if (-not $result -or -not $result.token) {
+        throw "Failed to obtain installation access token from GitHub API"
+    }
+
+    Write-Verbose "Successfully obtained installation access token (expires: $($result.expires_at))"
+
+    # Create and return session with the installation access token
+    $session = New-GithubSession -OrganizationName $OrganizationName -Token $result.token
+
+    Write-Output $session
+}
+
 function Invoke-GithubRestMethod {
     [CmdletBinding()]
     Param(

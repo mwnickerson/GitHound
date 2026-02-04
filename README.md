@@ -94,6 +94,39 @@ Once the PAT is created, GitHub will present it to you as shown below. You must 
 
 ![Save the PAT](./images/7_save_pat.png)
 
+### Using GitHub App Authentication (Higher Rate Limits)
+
+For large organizations that may hit rate limits with personal access tokens, you can use GitHub App authentication which provides significantly higher rate limits (5,000 requests/hour for Installation Access Tokens vs 5,000/hour for PATs, but App tokens are scoped to the installation).
+
+#### Prerequisites
+
+1. **Create a GitHub App** in your organization:
+   - Go to Organization Settings → Developer settings → GitHub Apps → New GitHub App
+   - Set the required permissions (same as the PAT permissions listed above)
+   - Generate and download a private key (.pem file)
+   - Note the **Client ID** (starts with `Iv1.`)
+
+2. **Install the App** in your organization:
+   - Go to your GitHub App settings → Install App
+   - Select your organization and authorize access
+   - Note the **Installation ID** from the URL (e.g., `https://github.com/settings/installations/12345678` → Installation ID is `12345678`)
+
+#### Creating a Session with GitHub App JWT
+
+```powershell
+$session = New-GitHubJwtSession `
+    -OrganizationName "your-org" `
+    -ClientId "Iv1.abc123def456" `
+    -PrivateKeyPath "./path/to/private-key.pem" `
+    -AppInstallationId "12345678"
+```
+
+Then run the collection as normal:
+
+```powershell
+Invoke-GitHound -Session $session
+```
+
 ### Running the Collection
 
 1. Open a PowerShell terminal
@@ -120,6 +153,53 @@ Once the PAT is created, GitHub will present it to you as shown below. You must 
     This will output the payload to the current working directory as `githound_<your_org_identifier>.json`.
 
 5. Upload the payload via the Ingest File page in BloodHound or via the API.
+
+### CLI Arguments
+#### Collection Args
+
+`-Collect` - Choose which data to collect instead of running everything 
+
+Values: `All`, `Users`, `Teams`, `Repos`, `Branches`, `Workflows`, `Environments`, `Secrets`, `TeamRoles`, `OrgRoles`, `RepoRoles`, `SecretScanning`, `AppInstallations`, `Saml`
+
+**Collect only users and teams**
+
+```PowerShell
+Invoke-GitHound -Session $session -Collect @('users', 'Teams')
+```
+
+**Collect repos and branch protections only**
+
+```Powershell
+Invoke-GitHound -Session $session -Collect @('Repos', 'Branches')
+```
+
+#### Filter Args
+`-RepoFilter` - Filter Repos by name, supports wildcards
+```PowerShell
+Invoke-GitHound -Session $session -RepoFilter 'api-*'
+```
+
+`-RepoVisibility` - Filter repos by visibility (public, private, internal)
+```PowerShell
+Invoke-GitHound -Session $session -RepoVisibility 'internal'
+```
+
+#### Output
+`-OutputPath` - Custom Output Directory (default behavior is dropped into running folder)
+```PowerShell
+Invoke-GitHound -Session $session -OutputPath './collection/'
+```
+`-Zip` - Compress to a zip file and removes output folder
+```PowerShell
+Invoke-GitHound -Session $session -Zip
+```
+
+#### Resume
+Due to GitHUb rate limiting large organizations may hit a rate limit. The collector sleeps and resumes, but in case it fails there is a resume function.
+`-Resume` - Resumes from an interrupted state
+```PowerShell
+Invoke-GitHound -Session $session -Resume './20240202180026_O_abcdefghi/'
+```
 
 ### Sample
 
