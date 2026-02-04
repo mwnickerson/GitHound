@@ -1082,6 +1082,184 @@ function Invoke-GitHoundBatchedCollection {
     }
 }
 
+function Invoke-GitHoundPaginatedRestMethod {
+    <#
+    .SYNOPSIS
+        Fetches paginated REST API results with per-page checkpointing support.
+
+    .DESCRIPTION
+        Fetches data from a GitHub REST API endpoint that supports pagination,
+        saving progress after each page to enable resume from interruption.
+
+    .PARAMETER Session
+        A GitHound.Session object used for authentication and API requests.
+
+    .PARAMETER Path
+        The API path to fetch (e.g., "orgs/my-org/repos").
+
+    .PARAMETER PerPage
+        Number of items per page. Defaults to 100 (GitHub's max).
+
+    .PARAMETER StartPage
+        Page number to start from (for resume). Defaults to 1.
+
+    .PARAMETER PhaseName
+        Name of the phase for checkpoint tracking.
+
+    .PARAMETER OutputFolder
+        Output folder for incremental data files.
+
+    .PARAMETER ProcessItem
+        ScriptBlock to process each item. Receives $Item parameter.
+        Should return @{ Nodes = @(); Edges = @() } or similar.
+
+    .PARAMETER SaveCheckpointFunc
+        ScriptBlock to call after each page to save checkpoint.
+
+    .PARAMETER PhaseProgressRef
+        Reference to phase progress hashtable to update with currentPage.
+
+    .OUTPUTS
+        Array of all items fetched from the API.
+    #>
+    Param(
+        [Parameter(Mandatory = $true)]
+        [PSTypeName('GitHound.Session')]
+        $Session,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $false)]
+        [int]$PerPage = 100,
+
+        [Parameter(Mandatory = $false)]
+        [int]$StartPage = 1,
+
+        [Parameter(Mandatory = $false)]
+        [string]$PhaseName = '',
+
+        [Parameter(Mandatory = $false)]
+        [string]$OutputFolder = '',
+
+        [Parameter(Mandatory = $false)]
+        [scriptblock]$ProcessItem = $null,
+
+        [Parameter(Mandatory = $false)]
+        [scriptblock]$SaveCheckpointFunc = $null,
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$PhaseProgressRef = $null
+    )
+
+    $allItems = New-Object System.Collections.ArrayList
+    $allNodes = New-Object System.Collections.ArrayList
+    $allEdges = New-Object System.Collections.ArrayList
+    $page = $StartPage
+    $hasMore = $true
+
+    if ($StartPage -gt 1) {
+        Write-Host "[*] $PhaseName`: Resuming from page $StartPage"
+    }
+
+    while ($hasMore) {
+        $requestSuccessful = $false
+        $retryCount = 0
+
+        while (-not $requestSuccessful -and $retryCount -lt 3) {
+            try {
+                $separator = if ($Path -match '\?') { '&' } else { '?' }
+                $uri = "$($Session.Uri)$($Path)${separator}page=$page&per_page=$PerPage"
+                Write-Verbose "Fetching: $uri"
+
+                $response = Invoke-WebRequest -Uri $uri -Headers $Session.Headers -Method GET -ErrorAction Stop
+                $requestSuccessful = $true
+            }
+            catch {
+                $httpException = $_.ErrorDetails | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($httpException -and (($httpException.status -eq "403" -and $httpException.message -match "rate limit") -or $httpException.status -eq "429")) {
+                    Write-Warning "Rate limit hit on page $page. Retry $($retryCount + 1)/3"
+                    Wait-GithubRestRateLimit -Session $Session
+                    $retryCount++
+                }
+                else {
+                    throw $_
+                }
+            }
+        }
+
+        if (-not $requestSuccessful) {
+            throw "Failed after 3 retry attempts due to rate limiting on page $page"
+        }
+
+        $pageItems = $response.Content | ConvertFrom-Json
+
+        # Check if we got any items
+        if (-not $pageItems -or $pageItems.Count -eq 0) {
+            $hasMore = $false
+            continue
+        }
+
+        # Add items to collection
+        foreach ($item in $pageItems) {
+            $null = $allItems.Add($item)
+
+            # Process item if processor provided
+            if ($ProcessItem) {
+                $result = & $ProcessItem -Item $item
+                if ($result.Nodes) { $null = $allNodes.AddRange(@($result.Nodes)) }
+                if ($result.Edges) { $null = $allEdges.AddRange(@($result.Edges)) }
+            }
+        }
+
+        # Write incremental data if output folder provided
+        if ($OutputFolder -and $PhaseName -and $ProcessItem) {
+            Write-GitHoundIncrementalData -OutputPath $OutputFolder -PhaseName $PhaseName `
+                -Nodes @($allNodes | Select-Object -Last $pageItems.Count) `
+                -Edges @($allEdges | Select-Object -Last ($allEdges.Count)) `
+                -ProcessedItemIds @()
+        }
+
+        # Update phase progress
+        if ($PhaseProgressRef) {
+            $PhaseProgressRef.currentPage = $page
+            $PhaseProgressRef.itemsCollected = $allItems.Count
+        }
+
+        # Save checkpoint
+        if ($SaveCheckpointFunc) {
+            & $SaveCheckpointFunc
+        }
+
+        Write-Host "[*] $PhaseName`: Page $page complete ($($pageItems.Count) items, $($allItems.Count) total)"
+
+        # Check for next page via Link header
+        $hasMore = $false
+        if ($response.Headers['Link']) {
+            $links = $response.Headers['Link'].Split(',')
+            foreach ($link in $links) {
+                if ($link -match 'rel="next"') {
+                    $hasMore = $true
+                    break
+                }
+            }
+        }
+
+        $page++
+    }
+
+    # Return results
+    if ($ProcessItem) {
+        return [PSCustomObject]@{
+            Items = $allItems.ToArray()
+            Nodes = $allNodes.ToArray()
+            Edges = $allEdges.ToArray()
+        }
+    } else {
+        return $allItems.ToArray()
+    }
+}
+
 function Git-HoundOrganization
 {
     <#
@@ -3492,17 +3670,174 @@ function Invoke-GitHound
     if ($Collect -contains 'Users') {
         if ($completedPhases -notcontains 'users') {
             Write-Host "[*] Enumerating Organization Users"
-            $users = $org.nodes[0] | Git-HoundUser -Session $Session -Limit $UserLimit -ThrottleLimit $ThrottleLimit
 
-            $userNodes = New-Object System.Collections.ArrayList
-            $userEdges = New-Object System.Collections.ArrayList
-            if ($users) { $null = $userNodes.AddRange(@($users)) }
+            # Load existing progress if resuming mid-phase
+            $startPage = 1
+            $existingIncrementalData = $null
+            $incrementalFile = Join-Path $outputFolder "_users_incremental.jsonl"
+            if ($phaseProgress.users) {
+                $startPage = $phaseProgress.users.currentPage + 1
+                if (Test-Path $incrementalFile) {
+                    $existingIncrementalData = Read-GitHoundIncrementalData -FilePath $incrementalFile
+                }
+                Write-Host "[*] Resuming users from page $startPage"
+            }
 
+            # Initialize phase progress if not resuming
+            if (-not $phaseProgress.users) {
+                $phaseProgress.users = @{
+                    status = 'in_progress'
+                    currentPage = 0
+                    itemsCollected = 0
+                }
+            }
+
+            # Collect users with pagination checkpointing
+            $userNodes = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+
+            # Load existing incremental data if resuming
+            if ($existingIncrementalData -and $existingIncrementalData.Nodes) {
+                foreach ($node in $existingIncrementalData.Nodes) {
+                    $null = $userNodes.Add($node)
+                }
+            }
+
+            # Fetch members page by page with checkpointing
+            $page = $startPage
+            $hasMore = $true
+            $orgLogin = $org.nodes[0].Properties.login
+            $orgNodeId = $org.nodes[0].Properties.node_id
+            $totalUsersCollected = $userNodes.Count
+            $userLimitReached = $false
+
+            while ($hasMore -and -not $userLimitReached) {
+                $requestSuccessful = $false
+                $retryCount = 0
+
+                while (-not $requestSuccessful -and $retryCount -lt 3) {
+                    try {
+                        $uri = "$($Session.Uri)orgs/$orgLogin/members?page=$page&per_page=100"
+                        Write-Verbose "Fetching: $uri"
+                        $response = Invoke-WebRequest -Uri $uri -Headers $Session.Headers -Method GET -ErrorAction Stop
+                        $requestSuccessful = $true
+                    }
+                    catch {
+                        $httpException = $_.ErrorDetails | ConvertFrom-Json -ErrorAction SilentlyContinue
+                        if ($httpException -and (($httpException.status -eq "403" -and $httpException.message -match "rate limit") -or $httpException.status -eq "429")) {
+                            Write-Warning "Rate limit hit on page $page. Retry $($retryCount + 1)/3"
+                            Wait-GithubRestRateLimit -Session $Session
+                            $retryCount++
+                        }
+                        else {
+                            throw $_
+                        }
+                    }
+                }
+
+                if (-not $requestSuccessful) {
+                    throw "Failed after 3 retry attempts due to rate limiting on page $page"
+                }
+
+                $pageMembers = $response.Content | ConvertFrom-Json
+
+                if (-not $pageMembers -or $pageMembers.Count -eq 0) {
+                    $hasMore = $false
+                    continue
+                }
+
+                # Apply UserLimit if specified
+                if ($UserLimit -gt 0) {
+                    $remaining = $UserLimit - $totalUsersCollected
+                    if ($remaining -le 0) {
+                        $userLimitReached = $true
+                        continue
+                    }
+                    if ($pageMembers.Count -gt $remaining) {
+                        $pageMembers = $pageMembers | Select-Object -First $remaining
+                        $userLimitReached = $true
+                    }
+                }
+
+                # Process user details in parallel for this page
+                $pageNodes = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+
+                $pageMembers | ForEach-Object -Parallel {
+                    $pageNodes = $using:pageNodes
+                    $Session = $using:Session
+                    $orgLogin = $using:orgLogin
+                    $orgNodeId = $using:orgNodeId
+                    $functionBundle = $using:GitHoundFunctionBundle
+                    foreach($funcName in $functionBundle.Keys) {
+                        Set-Item -Path "function:$funcName" -Value ([scriptblock]::Create($functionBundle[$funcName]))
+                    }
+
+                    $user = $_
+                    try {
+                        $user_details = Invoke-GithubRestMethod -Session $Session -Path "user/$($user.id)"
+                    } catch {
+                        continue
+                    }
+
+                    $properties = @{
+                        id                  = Normalize-Null $user.id
+                        node_id             = Normalize-Null $user.node_id
+                        name                = Normalize-Null $user.login
+                        organization_name   = Normalize-Null $orgLogin
+                        organization_id     = Normalize-Null $orgNodeId
+                        login               = Normalize-Null $user.login
+                        full_name           = Normalize-Null $user_details.name
+                        company             = Normalize-Null $user_details.company
+                        email               = Normalize-Null $user_details.email
+                        twitter_username    = Normalize-Null $user_details.twitter_username
+                        type                = Normalize-Null $user.type
+                        site_admin          = Normalize-Null $user.site_admin
+                    }
+
+                    $null = $pageNodes.Add((New-GitHoundNode -Id $user.node_id -Kind 'GHUser' -Properties $properties))
+                } -ThrottleLimit $ThrottleLimit
+
+                # Add page nodes to running total
+                foreach ($node in $pageNodes) {
+                    $null = $userNodes.Add($node)
+                }
+                $totalUsersCollected = $userNodes.Count
+
+                # Write incremental data
+                Write-GitHoundIncrementalData -OutputPath $outputFolder -PhaseName 'users' `
+                    -Nodes @($pageNodes) -Edges @() -ProcessedItemIds @()
+
+                # Update checkpoint
+                $phaseProgress.users.currentPage = $page
+                $phaseProgress.users.itemsCollected = $totalUsersCollected
+                Save-Checkpoint
+
+                Write-Host "[*] users: Page $page complete ($($pageMembers.Count) members, $totalUsersCollected total)"
+
+                # Check for next page
+                $hasMore = $false
+                if ($response.Headers['Link']) {
+                    $links = $response.Headers['Link'].Split(',')
+                    foreach ($link in $links) {
+                        if ($link -match 'rel="next"') {
+                            $hasMore = $true
+                            break
+                        }
+                    }
+                }
+                $page++
+            }
+
+            # Write final output
+            $userNodesArray = @($userNodes)
             $userFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
-                -PhaseName 'users' -Tier 1 -Nodes $userNodes -Edges $userEdges
+                -PhaseName 'users' -Tier 1 -Nodes $userNodesArray -Edges @()
             $null = $writtenFiles.Add(@{ File = $userFile; Tier = 1; Phase = 'users' })
 
-            if ($users) { $null = $allNodes.AddRange(@($users)) }
+            if ($userNodesArray.Count -gt 0) { $null = $allNodes.AddRange($userNodesArray) }
+
+            # Cleanup incremental file and phase progress
+            if (Test-Path $incrementalFile) { Remove-Item $incrementalFile -Force }
+            $phaseProgress.Remove('users')
 
             $completedPhases += 'users'
             Save-Checkpoint
@@ -3525,19 +3860,142 @@ function Invoke-GitHound
     if ($Collect -contains 'Teams') {
         if ($completedPhases -notcontains 'teams') {
             Write-Host "[*] Enumerating Organization Teams"
-            $teams = $org.nodes[0] | Git-HoundTeam -Session $Session
 
+            # Load existing progress if resuming mid-phase
+            $startPage = 1
+            $existingIncrementalData = $null
+            $incrementalFile = Join-Path $outputFolder "_teams_incremental.jsonl"
+            if ($phaseProgress.teams) {
+                $startPage = $phaseProgress.teams.currentPage + 1
+                if (Test-Path $incrementalFile) {
+                    $existingIncrementalData = Read-GitHoundIncrementalData -FilePath $incrementalFile
+                }
+                Write-Host "[*] Resuming teams from page $startPage"
+            }
+
+            # Initialize phase progress if not resuming
+            if (-not $phaseProgress.teams) {
+                $phaseProgress.teams = @{
+                    status = 'in_progress'
+                    currentPage = 0
+                    itemsCollected = 0
+                }
+            }
+
+            # Collect teams with pagination checkpointing
             $teamNodes = New-Object System.Collections.ArrayList
             $teamEdges = New-Object System.Collections.ArrayList
-            if ($teams.nodes) { $null = $teamNodes.AddRange(@($teams.nodes)) }
-            if ($teams.edges) { $null = $teamEdges.AddRange(@($teams.edges)) }
 
+            # Load existing incremental data if resuming
+            if ($existingIncrementalData) {
+                if ($existingIncrementalData.Nodes) { $null = $teamNodes.AddRange(@($existingIncrementalData.Nodes)) }
+                if ($existingIncrementalData.Edges) { $null = $teamEdges.AddRange(@($existingIncrementalData.Edges)) }
+            }
+
+            # Fetch teams page by page with checkpointing
+            $page = $startPage
+            $hasMore = $true
+            $orgLogin = $org.nodes[0].Properties.login
+            $orgNodeId = $org.nodes[0].Properties.node_id
+
+            while ($hasMore) {
+                $requestSuccessful = $false
+                $retryCount = 0
+
+                while (-not $requestSuccessful -and $retryCount -lt 3) {
+                    try {
+                        $uri = "$($Session.Uri)orgs/$orgLogin/teams?page=$page&per_page=100"
+                        Write-Verbose "Fetching: $uri"
+                        $response = Invoke-WebRequest -Uri $uri -Headers $Session.Headers -Method GET -ErrorAction Stop
+                        $requestSuccessful = $true
+                    }
+                    catch {
+                        $httpException = $_.ErrorDetails | ConvertFrom-Json -ErrorAction SilentlyContinue
+                        if ($httpException -and (($httpException.status -eq "403" -and $httpException.message -match "rate limit") -or $httpException.status -eq "429")) {
+                            Write-Warning "Rate limit hit on page $page. Retry $($retryCount + 1)/3"
+                            Wait-GithubRestRateLimit -Session $Session
+                            $retryCount++
+                        }
+                        else {
+                            throw $_
+                        }
+                    }
+                }
+
+                if (-not $requestSuccessful) {
+                    throw "Failed after 3 retry attempts due to rate limiting on page $page"
+                }
+
+                $pageTeams = $response.Content | ConvertFrom-Json
+
+                if (-not $pageTeams -or $pageTeams.Count -eq 0) {
+                    $hasMore = $false
+                    continue
+                }
+
+                # Process each team on this page
+                $pageNodes = New-Object System.Collections.ArrayList
+                $pageEdges = New-Object System.Collections.ArrayList
+
+                foreach ($team in $pageTeams) {
+                    $properties = [pscustomobject]@{
+                        id                = Normalize-Null $team.id
+                        node_id           = Normalize-Null $team.node_id
+                        name              = Normalize-Null $team.name
+                        organization_name = Normalize-Null $orgLogin
+                        organization_id   = Normalize-Null $orgNodeId
+                        slug              = Normalize-Null $team.slug
+                        description       = Normalize-Null $team.description
+                        privacy           = Normalize-Null $team.privacy
+                        permission        = Normalize-Null $team.permission
+                    }
+                    $null = $pageNodes.Add((New-GitHoundNode -Id $team.node_id -Kind 'GHTeam' -Properties $properties))
+
+                    if ($null -ne $team.parent) {
+                        $null = $pageEdges.Add((New-GitHoundEdge -Kind GHMemberOf -StartId $team.node_id -EndId $team.Parent.node_id -Properties @{ traversable = $true }))
+                    }
+                }
+
+                # Add to running totals
+                $null = $teamNodes.AddRange($pageNodes)
+                $null = $teamEdges.AddRange($pageEdges)
+
+                # Write incremental data
+                Write-GitHoundIncrementalData -OutputPath $outputFolder -PhaseName 'teams' `
+                    -Nodes $pageNodes.ToArray() -Edges $pageEdges.ToArray() -ProcessedItemIds @()
+
+                # Update checkpoint
+                $phaseProgress.teams.currentPage = $page
+                $phaseProgress.teams.itemsCollected = $teamNodes.Count
+                Save-Checkpoint
+
+                Write-Host "[*] teams: Page $page complete ($($pageTeams.Count) teams, $($teamNodes.Count) total)"
+
+                # Check for next page
+                $hasMore = $false
+                if ($response.Headers['Link']) {
+                    $links = $response.Headers['Link'].Split(',')
+                    foreach ($link in $links) {
+                        if ($link -match 'rel="next"') {
+                            $hasMore = $true
+                            break
+                        }
+                    }
+                }
+                $page++
+            }
+
+            # Write final output
             $teamFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
                 -PhaseName 'teams' -Tier 1 -Nodes $teamNodes -Edges $teamEdges
             $null = $writtenFiles.Add(@{ File = $teamFile; Tier = 1; Phase = 'teams' })
 
-            if ($teams.nodes) { $null = $allNodes.AddRange(@($teams.nodes)) }
-            if ($teams.edges) { $null = $allEdges.AddRange(@($teams.edges)) }
+            if ($teamNodes.Count -gt 0) { $null = $allNodes.AddRange($teamNodes) }
+            if ($teamEdges.Count -gt 0) { $null = $allEdges.AddRange($teamEdges) }
+
+            # Cleanup incremental file and phase progress
+            if (Test-Path $incrementalFile) { Remove-Item $incrementalFile -Force }
+            $phaseProgress.Remove('teams')
 
             $completedPhases += 'teams'
             Save-Checkpoint
@@ -3560,53 +4018,213 @@ function Invoke-GitHound
     # Note: Repos must always be collected if any repo-dependent phase needs to run
     $repos = $null
     if ($Collect -contains 'Repos') {
-        # Always collect repos data (needed for subsequent phases)
-        Write-Host "[*] Enumerating Organization Repositories"
-        $repos = $org.nodes[0] | Git-HoundRepository -Session $Session
-
-        # Apply RepoFilter
-        if ($RepoFilter -ne '') {
-            $filteredNodes = $repos.nodes | Where-Object { $_.properties.name -like $RepoFilter }
-            $repos.nodes = $filteredNodes
-            Write-Host "[*] Filtered to $($repos.nodes.Count) repositories matching '$RepoFilter'"
-        }
-
-        # Apply RepoVisibility filter
-        if ($RepoVisibility -ne 'all') {
-            $filteredNodes = $repos.nodes | Where-Object { $_.properties.visibility -eq $RepoVisibility }
-            $repos.nodes = $filteredNodes
-            Write-Host "[*] Filtered to $($repos.nodes.Count) $RepoVisibility repositories"
-        }
-
-        # Rebuild edges to only include filtered repos
-        if ($RepoFilter -ne '' -or $RepoVisibility -ne 'all') {
-            $filteredRepoIds = $repos.nodes | ForEach-Object { $_.id }
-            $repos.edges = $repos.edges | Where-Object { $filteredRepoIds -contains $_.end.value }
-        }
-
-        # Only write if not already completed
         if ($completedPhases -notcontains 'repos') {
+            Write-Host "[*] Enumerating Organization Repositories"
+
+            # Load existing progress if resuming mid-phase
+            $startPage = 1
+            $existingIncrementalData = $null
+            $incrementalFile = Join-Path $outputFolder "_repos_incremental.jsonl"
+            if ($phaseProgress.repos) {
+                $startPage = $phaseProgress.repos.currentPage + 1
+                if (Test-Path $incrementalFile) {
+                    $existingIncrementalData = Read-GitHoundIncrementalData -FilePath $incrementalFile
+                }
+                Write-Host "[*] Resuming repos from page $startPage"
+            }
+
+            # Initialize phase progress if not resuming
+            if (-not $phaseProgress.repos) {
+                $phaseProgress.repos = @{
+                    status = 'in_progress'
+                    currentPage = 0
+                    itemsCollected = 0
+                }
+            }
+
+            # Fetch actions permissions (needed for processing)
+            $actions = Invoke-GithubRestMethod -Session $Session -Path "orgs/$($org.nodes[0].Properties.login)/actions/permissions"
+            $enabledRepos = $null
+            if ($actions.enabled_repositories -ne 'all') {
+                $enabledRepos = (Invoke-GithubRestMethod -Session $Session -Path "orgs/$($org.nodes[0].Properties.login)/actions/permissions/repositories").repositories.node_id
+            }
+
+            # Collect repos with pagination checkpointing
             $repoNodes = New-Object System.Collections.ArrayList
             $repoEdges = New-Object System.Collections.ArrayList
-            if ($repos.nodes) { $null = $repoNodes.AddRange(@($repos.nodes)) }
-            if ($repos.edges) { $null = $repoEdges.AddRange(@($repos.edges)) }
 
+            # Load existing incremental data if resuming
+            if ($existingIncrementalData) {
+                if ($existingIncrementalData.Nodes) { $null = $repoNodes.AddRange(@($existingIncrementalData.Nodes)) }
+                if ($existingIncrementalData.Edges) { $null = $repoEdges.AddRange(@($existingIncrementalData.Edges)) }
+            }
+
+            # Fetch repos page by page with checkpointing
+            $page = $startPage
+            $hasMore = $true
+            $orgLogin = $org.nodes[0].Properties.login
+            $orgNodeId = $org.nodes[0].Properties.node_id
+
+            while ($hasMore) {
+                $requestSuccessful = $false
+                $retryCount = 0
+
+                while (-not $requestSuccessful -and $retryCount -lt 3) {
+                    try {
+                        $uri = "$($Session.Uri)orgs/$orgLogin/repos?page=$page&per_page=100"
+                        Write-Verbose "Fetching: $uri"
+                        $response = Invoke-WebRequest -Uri $uri -Headers $Session.Headers -Method GET -ErrorAction Stop
+                        $requestSuccessful = $true
+                    }
+                    catch {
+                        $httpException = $_.ErrorDetails | ConvertFrom-Json -ErrorAction SilentlyContinue
+                        if ($httpException -and (($httpException.status -eq "403" -and $httpException.message -match "rate limit") -or $httpException.status -eq "429")) {
+                            Write-Warning "Rate limit hit on page $page. Retry $($retryCount + 1)/3"
+                            Wait-GithubRestRateLimit -Session $Session
+                            $retryCount++
+                        }
+                        else {
+                            throw $_
+                        }
+                    }
+                }
+
+                if (-not $requestSuccessful) {
+                    throw "Failed after 3 retry attempts due to rate limiting on page $page"
+                }
+
+                $pageRepos = $response.Content | ConvertFrom-Json
+
+                if (-not $pageRepos -or $pageRepos.Count -eq 0) {
+                    $hasMore = $false
+                    continue
+                }
+
+                # Process each repo on this page
+                $pageNodes = New-Object System.Collections.ArrayList
+                $pageEdges = New-Object System.Collections.ArrayList
+
+                foreach ($repo in $pageRepos) {
+                    $actionsEnabled = if ($actions.enabled_repositories -eq 'all') { $true } else { $enabledRepos -contains $repo.node_id }
+
+                    $properties = @{
+                        id                           = Normalize-Null $repo.id
+                        node_id                      = Normalize-Null $repo.node_id
+                        name                         = Normalize-Null $repo.name
+                        organization_name            = Normalize-Null $orgLogin
+                        organization_id              = Normalize-Null $orgNodeId
+                        owner_id                     = Normalize-Null $repo.owner.id
+                        owner_node_id                = Normalize-Null $repo.owner.node_id
+                        owner_name                   = Normalize-Null $repo.owner.login
+                        full_name                    = Normalize-Null $repo.full_name
+                        private                      = Normalize-Null $repo.private
+                        html_url                     = Normalize-Null $repo.html_url
+                        description                  = Normalize-Null $repo.description
+                        created_at                   = Normalize-Null $repo.created_at
+                        updated_at                   = Normalize-Null $repo.updated_at
+                        pushed_at                    = Normalize-Null $repo.pushed_at
+                        archived                     = Normalize-Null $repo.archived
+                        disabled                     = Normalize-Null $repo.disabled
+                        open_issues_count            = Normalize-Null $repo.open_issues_count
+                        allow_forking                = Normalize-Null $repo.allow_forking
+                        web_commit_signoff_required  = Normalize-Null $repo.web_commit_signoff_required
+                        visibility                   = Normalize-Null $repo.visibility
+                        forks                        = Normalize-Null $repo.forks
+                        open_issues                  = Normalize-Null $repo.open_issues
+                        watchers                     = Normalize-Null $repo.watchers
+                        default_branch               = Normalize-Null $repo.default_branch
+                        actions_enabled              = Normalize-Null $actionsEnabled
+                        secret_scanning              = Normalize-Null $repo.security_and_analysis.secret_scanning.status
+                    }
+
+                    $null = $pageNodes.Add((New-GitHoundNode -Id $repo.node_id -Kind 'GHRepository' -Properties $properties))
+                    $null = $pageEdges.Add((New-GitHoundEdge -Kind 'GHOwns' -StartId $orgNodeId -EndId $repo.node_id -Properties @{ traversable = $true }))
+                }
+
+                # Add to running totals
+                $null = $repoNodes.AddRange($pageNodes)
+                $null = $repoEdges.AddRange($pageEdges)
+
+                # Write incremental data
+                Write-GitHoundIncrementalData -OutputPath $outputFolder -PhaseName 'repos' `
+                    -Nodes $pageNodes.ToArray() -Edges $pageEdges.ToArray() -ProcessedItemIds @()
+
+                # Update checkpoint
+                $phaseProgress.repos.currentPage = $page
+                $phaseProgress.repos.itemsCollected = $repoNodes.Count
+                Save-Checkpoint
+
+                Write-Host "[*] repos: Page $page complete ($($pageRepos.Count) repos, $($repoNodes.Count) total)"
+
+                # Check for next page
+                $hasMore = $false
+                if ($response.Headers['Link']) {
+                    $links = $response.Headers['Link'].Split(',')
+                    foreach ($link in $links) {
+                        if ($link -match 'rel="next"') {
+                            $hasMore = $true
+                            break
+                        }
+                    }
+                }
+                $page++
+            }
+
+            # Build repos object for subsequent phases
+            $repos = [PSCustomObject]@{
+                nodes = $repoNodes.ToArray()
+                edges = $repoEdges.ToArray()
+            }
+
+            # Apply RepoFilter
+            if ($RepoFilter -ne '') {
+                $filteredNodes = $repos.nodes | Where-Object { $_.properties.name -like $RepoFilter }
+                $repos = [PSCustomObject]@{ nodes = @($filteredNodes); edges = $repos.edges }
+                Write-Host "[*] Filtered to $($repos.nodes.Count) repositories matching '$RepoFilter'"
+            }
+
+            # Apply RepoVisibility filter
+            if ($RepoVisibility -ne 'all') {
+                $filteredNodes = $repos.nodes | Where-Object { $_.properties.visibility -eq $RepoVisibility }
+                $repos = [PSCustomObject]@{ nodes = @($filteredNodes); edges = $repos.edges }
+                Write-Host "[*] Filtered to $($repos.nodes.Count) $RepoVisibility repositories"
+            }
+
+            # Rebuild edges to only include filtered repos
+            if ($RepoFilter -ne '' -or $RepoVisibility -ne 'all') {
+                $filteredRepoIds = $repos.nodes | ForEach-Object { $_.id }
+                $repos = [PSCustomObject]@{
+                    nodes = $repos.nodes
+                    edges = @($repos.edges | Where-Object { $filteredRepoIds -contains $_.end.value })
+                }
+            }
+
+            # Write final output
             $repoFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId `
-                -PhaseName 'repos' -Tier 1 -Nodes $repoNodes -Edges $repoEdges
+                -PhaseName 'repos' -Tier 1 -Nodes $repos.nodes -Edges $repos.edges
             $null = $writtenFiles.Add(@{ File = $repoFile; Tier = 1; Phase = 'repos' })
 
             if ($repos.nodes) { $null = $allNodes.AddRange(@($repos.nodes)) }
             if ($repos.edges) { $null = $allEdges.AddRange(@($repos.edges)) }
 
+            # Cleanup incremental file and phase progress
+            if (Test-Path $incrementalFile) { Remove-Item $incrementalFile -Force }
+            $phaseProgress.Remove('repos')
+
             $completedPhases += 'repos'
             Save-Checkpoint
         } else {
-            Write-Host "[*] Skipping repos file write (already completed)"
+            Write-Host "[*] Skipping repos phase (already completed)"
             $repoFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_repos.json"
             $null = $writtenFiles.Add(@{ File = $repoFile; Tier = 1; Phase = 'repos' })
-            # FIX: Load data from existing file so combined output includes this phase's data
+
+            # Load repos data for subsequent phases
             $existingData = Read-GitHoundPhaseData -FilePath $repoFile
             if ($existingData) {
+                $repos = [PSCustomObject]@{
+                    nodes = $existingData.Nodes
+                    edges = $existingData.Edges
+                }
                 if ($existingData.Nodes) { $null = $allNodes.AddRange(@($existingData.Nodes)) }
                 if ($existingData.Edges) { $null = $allEdges.AddRange(@($existingData.Edges)) }
             }
