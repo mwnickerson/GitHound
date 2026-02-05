@@ -356,11 +356,8 @@ function Invoke-GitHubGraphQL {
             # Handle rate limiting (429 or 403)
             if ($_.Exception.Message -match "rate limit" -or $statusCode -eq 429 -or $statusCode -eq 403) {
                 $retryCount++
-                Write-Warning "Rate limit hit. Waiting 60 seconds... (Retry $retryCount/5)"
-                Start-Sleep -Seconds 60
-
-                # Refresh token after rate limit wait (in case we waited a long time)
-                $null = Update-GitHubSessionToken -Session $Session
+                Write-Warning "GraphQL rate limit hit. Checking rate limit status... (Retry $retryCount/5)"
+                Wait-GitHubGraphQLRateLimit -Session $Session
             }
             else {
                 throw $_
@@ -574,6 +571,192 @@ function Read-GitHoundPhaseData {
 }
 
 # ===========================================
+# Rate Limit Functions (based on og-githound.ps1 pattern)
+# ===========================================
+function Get-RateLimitInformation {
+    <#
+    .SYNOPSIS
+        Queries the GitHub rate limit API and returns rate limit resources.
+    #>
+    Param(
+        [Parameter(Mandatory=$true)]
+        [PSTypeName('GitHound.Session')]$Session
+    )
+
+    $rateLimitInfo = Invoke-RestMethod -Uri "$($Session.Uri)rate_limit" -Headers $Session.Headers -Method GET -ErrorAction Stop
+    return $rateLimitInfo.resources
+}
+
+function Wait-GitHubRateLimitReached {
+    <#
+    .SYNOPSIS
+        Sleeps until the rate limit resets if we have exhausted our API calls.
+    .DESCRIPTION
+        Checks the remaining calls and reset timestamp. If remaining is 0,
+        sleeps until the reset time. After sleeping, refreshes the GitHub App
+        token since it likely expired during the wait.
+    #>
+    Param(
+        [Parameter(Mandatory=$true)]
+        [PSObject]$RateLimitInfo,
+
+        [Parameter(Mandatory=$true)]
+        [PSTypeName('GitHound.Session')]$Session
+    )
+
+    $resetTime = $RateLimitInfo.reset
+    $timeNow = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+    $timeToSleep = $resetTime - $timeNow
+
+    if ($RateLimitInfo.remaining -eq 0 -and $timeToSleep -gt 0) {
+        $resetLocal = ([System.DateTimeOffset]::FromUnixTimeSeconds($resetTime)).LocalDateTime
+        Write-Host "[!] Rate limit exhausted (0 remaining). Sleeping for $timeToSleep seconds until $($resetLocal.ToString('HH:mm:ss'))..." -ForegroundColor Yellow
+        Start-Sleep -Seconds ($timeToSleep + 2)
+
+        # Refresh token after sleeping - app tokens expire in 1 hour
+        $null = Update-GitHubSessionToken -Session $Session -Force
+        Write-Host "[+] Rate limit reset. Token refreshed. Resuming..." -ForegroundColor Green
+    }
+}
+
+function Wait-GitHubRestRateLimit {
+    <#
+    .SYNOPSIS
+        Checks the REST API rate limit and waits if exhausted.
+    #>
+    Param(
+        [Parameter(Mandatory=$true)]
+        [PSTypeName('GitHound.Session')]$Session
+    )
+
+    # Proactively refresh token if expiring soon
+    $null = Update-GitHubSessionToken -Session $Session
+
+    try {
+        $rateLimitInfo = Get-RateLimitInformation -Session $Session
+        Wait-GitHubRateLimitReached -RateLimitInfo $rateLimitInfo.core -Session $Session
+    }
+    catch {
+        Write-Warning "Could not check rate limit: $_"
+    }
+}
+
+function Wait-GitHubGraphQLRateLimit {
+    <#
+    .SYNOPSIS
+        Checks the GraphQL API rate limit and waits if exhausted.
+    #>
+    Param(
+        [Parameter(Mandatory=$true)]
+        [PSTypeName('GitHound.Session')]$Session
+    )
+
+    $null = Update-GitHubSessionToken -Session $Session
+
+    try {
+        $rateLimitInfo = Get-RateLimitInformation -Session $Session
+        Wait-GitHubRateLimitReached -RateLimitInfo $rateLimitInfo.graphql -Session $Session
+    }
+    catch {
+        Write-Warning "Could not check GraphQL rate limit: $_"
+    }
+}
+
+function Wait-GitHubRateLimit {
+    <#
+    .SYNOPSIS
+        Pre-phase rate limit check. Waits if remaining calls are below a threshold.
+    .DESCRIPTION
+        Called before each collection phase to ensure we have enough API calls
+        to make meaningful progress. If below the threshold, waits for reset.
+    #>
+    Param(
+        [Parameter(Mandatory=$true)]
+        [PSTypeName('GitHound.Session')]$Session,
+
+        [Parameter(Mandatory=$false)]
+        [int]$MinRemaining = 100
+    )
+
+    $null = Update-GitHubSessionToken -Session $Session
+
+    try {
+        $rateLimitInfo = Get-RateLimitInformation -Session $Session
+        $core = $rateLimitInfo.core
+        $resetLocal = ([System.DateTimeOffset]::FromUnixTimeSeconds($core.reset)).LocalDateTime
+
+        Write-Host "[*] Rate limit: $($core.remaining)/$($core.limit) remaining (resets at $($resetLocal.ToString('HH:mm:ss')))"
+
+        if ($core.remaining -lt $MinRemaining) {
+            $timeToSleep = $core.reset - [DateTimeOffset]::Now.ToUnixTimeSeconds()
+            if ($timeToSleep -gt 0) {
+                Write-Host "[!] Rate limit low ($($core.remaining) remaining). Sleeping $timeToSleep seconds until $($resetLocal.ToString('HH:mm:ss'))..." -ForegroundColor Yellow
+                Start-Sleep -Seconds ($timeToSleep + 2)
+
+                # Refresh token after sleeping - app tokens expire in 1 hour
+                $null = Update-GitHubSessionToken -Session $Session -Force
+                Write-Host "[+] Rate limit reset. Token refreshed. Resuming..." -ForegroundColor Green
+            }
+        }
+    }
+    catch {
+        Write-Warning "Could not check rate limit: $_. Continuing..."
+    }
+}
+
+function Get-PacedChunkInfo {
+    <#
+    .SYNOPSIS
+        Calculates chunk size and per-worker delay for paced REST execution.
+    .DESCRIPTION
+        Queries the GitHub REST rate limit and computes how many repos can fit
+        in the current rate limit budget, plus the delay each parallel worker
+        should sleep between calls to spread requests evenly.
+    #>
+    Param(
+        [Parameter(Mandatory=$true)]
+        [PSTypeName('GitHound.Session')]$Session,
+
+        [Parameter(Mandatory=$false)]
+        [decimal]$CallsPerRepo = 1,
+
+        [Parameter(Mandatory=$false)]
+        [int]$ThrottleLimit = 25
+    )
+
+    $null = Update-GitHubSessionToken -Session $Session
+
+    $rateLimitInfo = Get-RateLimitInformation -Session $Session
+    $core = $rateLimitInfo.core
+    $remaining = [int]$core.remaining
+    $resetUnix = [long]$core.reset
+    $secondsToReset = [Math]::Max($resetUnix - [DateTimeOffset]::Now.ToUnixTimeSeconds(), 1)
+
+    # Use 90% of remaining budget to leave headroom for retries
+    $chunkSize = [Math]::Floor($remaining * 0.9 / $CallsPerRepo)
+    $chunkSize = [Math]::Max($chunkSize, 0)
+
+    $delayMs = 0
+    if ($chunkSize -gt 0) {
+        # Spread calls evenly: total seconds / (chunkSize / workers) = seconds per worker-call
+        $callsPerWorker = [Math]::Max($chunkSize / $ThrottleLimit, 1)
+        $delayMs = [Math]::Floor(($secondsToReset * 1000) / $callsPerWorker)
+        # Cap delay at 60 seconds - anything longer indicates very low budget
+        $delayMs = [Math]::Min($delayMs, 60000)
+    }
+
+    $resetLocal = ([System.DateTimeOffset]::FromUnixTimeSeconds($resetUnix)).LocalDateTime
+
+    [PSCustomObject]@{
+        ChunkSize    = [int]$chunkSize
+        DelayMs      = [int]$delayMs
+        Remaining    = $remaining
+        ResetAt      = $resetLocal
+        SecondsToReset = [int]$secondsToReset
+    }
+}
+
+# ===========================================
 # REST API Helper
 # ===========================================
 function Invoke-GitHubRest {
@@ -623,11 +806,8 @@ function Invoke-GitHubRest {
             # Handle rate limiting (429 or 403)
             if ($statusCode -eq 429 -or $statusCode -eq 403) {
                 $retryCount++
-                Write-Warning "Rate limit hit. Waiting 60 seconds... (Retry $retryCount/5)"
-                Start-Sleep -Seconds 60
-
-                # Refresh token after rate limit wait
-                $null = Update-GitHubSessionToken -Session $Session
+                Write-Warning "Rate limit hit. Checking rate limit status... (Retry $retryCount/5)"
+                Wait-GitHubRestRateLimit -Session $Session
             }
             elseif ($statusCode -eq 404) {
                 # Resource not found - return empty result
@@ -871,119 +1051,157 @@ function Get-GraphQLBatchedRepoDetails {
         Write-Host "[*] Resuming: $processedCount repos already processed, $($Repositories.Count) remaining"
     }
 
-    # Process in batches
+    # Helper: Process the GraphQL result for a batch of repos
+    $ProcessBatchResult = {
+        param($result, $batch)
+        for ($j = 0; $j -lt $batch.Count; $j++) {
+            $repo = $batch[$j]
+            $repoData = $result.data."repo$j"
+
+            if (-not $repoData) { continue }
+
+            $repoId = $repo.id
+            $repoName = $repo.properties.name
+            $repoFullName = $repo.properties.full_name
+
+            # Build protection rules map
+            $protectionRules = @{}
+            if ($repoData.branchProtectionRules) {
+                foreach ($rule in $repoData.branchProtectionRules.nodes) {
+                    $protectionRules[$rule.pattern] = $rule
+                }
+            }
+
+            # Process branches
+            if ($repoData.refs) {
+                foreach ($branch in $repoData.refs.nodes) {
+                    $branchId = [System.BitConverter]::ToString(
+                        [System.Security.Cryptography.MD5]::Create().ComputeHash(
+                            [System.Text.Encoding]::UTF8.GetBytes("${OrgId}_${repoFullName}_$($branch.name)")
+                        )
+                    ).Replace('-', '')
+
+                    # Find matching protection rule
+                    $protection = $null
+                    foreach ($pattern in $protectionRules.Keys) {
+                        if ($branch.name -like $pattern -or $branch.name -eq $pattern) {
+                            $protection = $protectionRules[$pattern]
+                            break
+                        }
+                    }
+
+                    $props = [pscustomobject]@{
+                        name = "$repoName\$($branch.name)"
+                        id = $branchId
+                        short_name = $branch.name
+                        commit_hash = Normalize-Null $branch.target.oid
+                        commit_url = Normalize-Null $branch.target.url
+                        protected = ($null -ne $protection)
+                        organization = $OrgLogin
+                        organization_id = $OrgId
+                        repository_name = $repoFullName
+                        repository_id = $repoId
+                    }
+
+                    if ($protection) {
+                        $props | Add-Member -NotePropertyName 'protection_enforce_admins' -NotePropertyValue $protection.isAdminEnforced
+                        $props | Add-Member -NotePropertyName 'protection_lock_branch' -NotePropertyValue $protection.lockBranch
+                        $props | Add-Member -NotePropertyName 'protection_required_pull_request_reviews' -NotePropertyValue $protection.requiresApprovingReviews
+                        $props | Add-Member -NotePropertyName 'protection_required_approving_review_count' -NotePropertyValue $protection.requiredApprovingReviewCount
+                        $props | Add-Member -NotePropertyName 'protection_require_code_owner_reviews' -NotePropertyValue $protection.requiresCodeOwnerReviews
+                        $props | Add-Member -NotePropertyName 'protection_require_last_push_approval' -NotePropertyValue $protection.requireLastPushApproval
+
+                        # Bypass PR allowances
+                        foreach ($allowance in $protection.bypassPullRequestAllowances.nodes) {
+                            if ($allowance.actor.id) {
+                                $null = $edges.Add((New-GitHoundEdge -Kind 'GHBypassRequiredPullRequest' -StartId $allowance.actor.id -EndId $branchId -Properties @{ traversable = $false }))
+                            }
+                        }
+
+                        # Push allowances
+                        foreach ($allowance in $protection.pushAllowances.nodes) {
+                            if ($allowance.actor.id) {
+                                $null = $edges.Add((New-GitHoundEdge -Kind 'GHRestrictionsCanPush' -StartId $allowance.actor.id -EndId $branchId -Properties @{ traversable = $false }))
+                            }
+                        }
+                    }
+
+                    $null = $nodes.Add((New-GitHoundNode -Id $branchId -Kind 'GHBranch' -Properties $props))
+                    $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasBranch' -StartId $repoId -EndId $branchId -Properties @{ traversable = $true }))
+                }
+            }
+
+            # Process environments (basic info only - secrets need REST)
+            if ($repoData.environments) {
+                foreach ($env in $repoData.environments.nodes) {
+                    $envProps = [pscustomobject]@{
+                        name = "$repoName\$($env.name)"
+                        id = Normalize-Null $env.databaseId
+                        node_id = Normalize-Null $env.id
+                        organization = $OrgLogin
+                        organization_id = $OrgId
+                        repository_name = $repoFullName
+                        repository_id = $repoId
+                        short_name = Normalize-Null $env.name
+                    }
+
+                    $null = $nodes.Add((New-GitHoundNode -Id $env.id -Kind 'GHEnvironment' -Properties $envProps))
+                    $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasEnvironment' -StartId $repoId -EndId $env.id -Properties @{ traversable = $true }))
+                }
+            }
+
+            $processedCount++
+        }
+    }
+
+    # Process in batches with adaptive retry and split on failure
     for ($i = 0; $i -lt $Repositories.Count; $i += $BatchSize) {
         $batchNum++
         $batch = $Repositories[$i..([Math]::Min($i + $BatchSize - 1, $Repositories.Count - 1))]
 
-        # Build batched query
-        $query = New-BatchedRepoDetailsQuery -Repositories $batch -OrgLogin $OrgLogin
+        # Queue for adaptive splitting: start with the full batch
+        $batchQueue = [System.Collections.Queue]::new()
+        $batchQueue.Enqueue($batch)
 
-        try {
-            $result = Invoke-GitHubGraphQL -Session $Session -Query $query
+        while ($batchQueue.Count -gt 0) {
+            $currentBatch = $batchQueue.Dequeue()
+            $success = $false
 
-            # Process each repo in the batch
-            for ($j = 0; $j -lt $batch.Count; $j++) {
-                $repo = $batch[$j]
-                $repoData = $result.data."repo$j"
+            # Try up to 2 attempts before splitting
+            for ($attempt = 1; $attempt -le 2; $attempt++) {
+                try {
+                    $query = New-BatchedRepoDetailsQuery -Repositories $currentBatch -OrgLogin $OrgLogin
+                    $result = Invoke-GitHubGraphQL -Session $Session -Query $query
 
-                if (-not $repoData) { continue }
-
-                $repoId = $repo.id
-                $repoName = $repo.properties.name
-                $repoFullName = $repo.properties.full_name
-
-                # Build protection rules map
-                $protectionRules = @{}
-                if ($repoData.branchProtectionRules) {
-                    foreach ($rule in $repoData.branchProtectionRules.nodes) {
-                        $protectionRules[$rule.pattern] = $rule
+                    # Process the results
+                    & $ProcessBatchResult $result $currentBatch
+                    $success = $true
+                    break
+                }
+                catch {
+                    if ($attempt -lt 2) {
+                        Write-Warning "Batch of $($currentBatch.Count) repos failed (attempt $attempt/2). Retrying in 10 seconds..."
+                        Start-Sleep -Seconds 10
                     }
                 }
-
-                # Process branches
-                if ($repoData.refs) {
-                    foreach ($branch in $repoData.refs.nodes) {
-                        $branchId = [System.BitConverter]::ToString(
-                            [System.Security.Cryptography.MD5]::Create().ComputeHash(
-                                [System.Text.Encoding]::UTF8.GetBytes("${OrgId}_${repoFullName}_$($branch.name)")
-                            )
-                        ).Replace('-', '')
-
-                        # Find matching protection rule
-                        $protection = $null
-                        foreach ($pattern in $protectionRules.Keys) {
-                            if ($branch.name -like $pattern -or $branch.name -eq $pattern) {
-                                $protection = $protectionRules[$pattern]
-                                break
-                            }
-                        }
-
-                        $props = [pscustomobject]@{
-                            name = "$repoName\$($branch.name)"
-                            id = $branchId
-                            short_name = $branch.name
-                            commit_hash = Normalize-Null $branch.target.oid
-                            commit_url = Normalize-Null $branch.target.url
-                            protected = ($null -ne $protection)
-                            organization = $OrgLogin
-                            organization_id = $OrgId
-                            repository_name = $repoFullName
-                            repository_id = $repoId
-                        }
-
-                        if ($protection) {
-                            $props | Add-Member -NotePropertyName 'protection_enforce_admins' -NotePropertyValue $protection.isAdminEnforced
-                            $props | Add-Member -NotePropertyName 'protection_lock_branch' -NotePropertyValue $protection.lockBranch
-                            $props | Add-Member -NotePropertyName 'protection_required_pull_request_reviews' -NotePropertyValue $protection.requiresApprovingReviews
-                            $props | Add-Member -NotePropertyName 'protection_required_approving_review_count' -NotePropertyValue $protection.requiredApprovingReviewCount
-                            $props | Add-Member -NotePropertyName 'protection_require_code_owner_reviews' -NotePropertyValue $protection.requiresCodeOwnerReviews
-                            $props | Add-Member -NotePropertyName 'protection_require_last_push_approval' -NotePropertyValue $protection.requireLastPushApproval
-
-                            # Bypass PR allowances
-                            foreach ($allowance in $protection.bypassPullRequestAllowances.nodes) {
-                                if ($allowance.actor.id) {
-                                    $null = $edges.Add((New-GitHoundEdge -Kind 'GHBypassRequiredPullRequest' -StartId $allowance.actor.id -EndId $branchId -Properties @{ traversable = $false }))
-                                }
-                            }
-
-                            # Push allowances
-                            foreach ($allowance in $protection.pushAllowances.nodes) {
-                                if ($allowance.actor.id) {
-                                    $null = $edges.Add((New-GitHoundEdge -Kind 'GHRestrictionsCanPush' -StartId $allowance.actor.id -EndId $branchId -Properties @{ traversable = $false }))
-                                }
-                            }
-                        }
-
-                        $null = $nodes.Add((New-GitHoundNode -Id $branchId -Kind 'GHBranch' -Properties $props))
-                        $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasBranch' -StartId $repoId -EndId $branchId -Properties @{ traversable = $true }))
-                    }
-                }
-
-                # Process environments (basic info only - secrets need REST)
-                if ($repoData.environments) {
-                    foreach ($env in $repoData.environments.nodes) {
-                        $envProps = [pscustomobject]@{
-                            name = "$repoName\$($env.name)"
-                            id = Normalize-Null $env.databaseId
-                            node_id = Normalize-Null $env.id
-                            organization = $OrgLogin
-                            organization_id = $OrgId
-                            repository_name = $repoFullName
-                            repository_id = $repoId
-                            short_name = Normalize-Null $env.name
-                        }
-
-                        $null = $nodes.Add((New-GitHoundNode -Id $env.id -Kind 'GHEnvironment' -Properties $envProps))
-                        $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasEnvironment' -StartId $repoId -EndId $env.id -Properties @{ traversable = $true }))
-                    }
-                }
-
-                $processedCount++
             }
-        }
-        catch {
-            Write-Warning "Failed to fetch batch $batchNum : $_"
+
+            if (-not $success) {
+                if ($currentBatch.Count -gt 1) {
+                    # Split the batch in half and re-queue both halves
+                    $mid = [Math]::Floor($currentBatch.Count / 2)
+                    $firstHalf = $currentBatch[0..($mid - 1)]
+                    $secondHalf = $currentBatch[$mid..($currentBatch.Count - 1)]
+                    Write-Warning "Batch of $($currentBatch.Count) repos failed after retries. Splitting into batches of $($firstHalf.Count) and $($secondHalf.Count)..."
+                    $batchQueue.Enqueue($firstHalf)
+                    $batchQueue.Enqueue($secondHalf)
+                }
+                else {
+                    # Single repo still failing - skip it
+                    Write-Warning "Skipping repo $($currentBatch[0].properties.full_name) after repeated failures"
+                    $processedCount++
+                }
+            }
         }
 
         Write-Host "[*] batched-details: Processed $processedCount/$totalRepos repositories (batch $batchNum)..."
@@ -992,6 +1210,109 @@ function Get-GraphQLBatchedRepoDetails {
     [PSCustomObject]@{
         Nodes = $nodes
         Edges = $edges
+    }
+}
+
+function Invoke-PacedRestPhase {
+    <#
+    .SYNOPSIS
+        Wraps a REST phase with chunked execution and even-spread delay for pacing.
+    .DESCRIPTION
+        Splits repos into hour-sized chunks based on current rate limit budget.
+        Within each chunk, passes a per-worker delay so calls are evenly distributed.
+        Between chunks, refreshes the token. Merges results from all chunks.
+    #>
+    Param(
+        [Parameter(Mandatory=$true)]
+        [PSTypeName('GitHound.Session')]$Session,
+
+        [Parameter(Mandatory=$true)]
+        [array]$Repositories,
+
+        [Parameter(Mandatory=$false)]
+        [decimal]$CallsPerRepo = 1,
+
+        [Parameter(Mandatory=$false)]
+        [int]$ThrottleLimit = 25,
+
+        [Parameter(Mandatory=$true)]
+        [string]$PhaseName,
+
+        [Parameter(Mandatory=$true)]
+        [scriptblock]$InvokePhase
+    )
+
+    $allNodes = New-Object System.Collections.ArrayList
+    $allEdges = New-Object System.Collections.ArrayList
+    $totalRepos = $Repositories.Count
+    $processedSoFar = 0
+    $chunkNum = 0
+
+    while ($processedSoFar -lt $totalRepos) {
+        $chunkNum++
+        $remaining = $totalRepos - $processedSoFar
+
+        # Calculate chunk size and delay from current rate limit
+        try {
+            $chunkInfo = Get-PacedChunkInfo -Session $Session -CallsPerRepo $CallsPerRepo -ThrottleLimit $ThrottleLimit
+        }
+        catch {
+            Write-Warning "[Paced] Could not query rate limit: $_. Using conservative defaults."
+            $chunkInfo = [PSCustomObject]@{
+                ChunkSize = [Math]::Min(100, $remaining)
+                DelayMs = 5000
+                Remaining = 0
+                ResetAt = (Get-Date).AddMinutes(60)
+                SecondsToReset = 3600
+            }
+        }
+
+        $chunkSize = $chunkInfo.ChunkSize
+
+        # If chunk size is 0, we need to wait for rate limit reset
+        if ($chunkSize -le 0) {
+            $waitSec = $chunkInfo.SecondsToReset + 2
+            Write-Host "[Paced] $PhaseName: Rate limit exhausted ($($chunkInfo.Remaining) remaining). Waiting $waitSec seconds until $($chunkInfo.ResetAt.ToString('HH:mm:ss'))..." -ForegroundColor Yellow
+            Start-Sleep -Seconds $waitSec
+            $null = Update-GitHubSessionToken -Session $Session -Force
+            Write-Host "[Paced] $PhaseName: Rate limit reset. Token refreshed." -ForegroundColor Green
+            continue
+        }
+
+        # Don't overshoot
+        $chunkSize = [Math]::Min($chunkSize, $remaining)
+        $delayMs = $chunkInfo.DelayMs
+
+        # Slice repos for this chunk
+        $startIdx = $processedSoFar
+        $endIdx = $startIdx + $chunkSize - 1
+        $chunkRepos = $Repositories[$startIdx..$endIdx]
+
+        Write-Host "[Paced] $PhaseName chunk $chunkNum`: $($chunkRepos.Count) repos (${processedSoFar}/${totalRepos} done), delay ${delayMs}ms/worker, budget $($chunkInfo.Remaining) calls, resets $($chunkInfo.ResetAt.ToString('HH:mm:ss'))" -ForegroundColor Cyan
+
+        # Invoke the phase function with this chunk
+        $result = & $InvokePhase $chunkRepos $delayMs
+
+        # Merge results
+        if ($result.Nodes -and $result.Nodes.Count -gt 0) {
+            $null = $allNodes.AddRange(@($result.Nodes))
+        }
+        if ($result.Edges -and $result.Edges.Count -gt 0) {
+            $null = $allEdges.AddRange(@($result.Edges))
+        }
+
+        $processedSoFar += $chunkRepos.Count
+        Write-Host "[Paced] $PhaseName: $processedSoFar/$totalRepos repos complete" -ForegroundColor Cyan
+
+        # Refresh token between chunks if more work remains
+        if ($processedSoFar -lt $totalRepos) {
+            $null = Update-GitHubSessionToken -Session $Session -Force
+        }
+    }
+
+    [PSCustomObject]@{
+        Nodes = $allNodes
+        Edges = $allEdges
     }
 }
 
@@ -1015,6 +1336,9 @@ function Get-RestWorkflows {
 
     .PARAMETER ThrottleLimit
         Maximum parallel threads. Default 25.
+
+    .PARAMETER RequestDelayMs
+        Per-worker delay in milliseconds before each API call for pacing. Default 0.
     #>
     Param(
         [Parameter(Mandatory=$true)]
@@ -1024,7 +1348,10 @@ function Get-RestWorkflows {
         [array]$Repositories,
 
         [Parameter(Mandatory=$false)]
-        [int]$ThrottleLimit = 25
+        [int]$ThrottleLimit = 25,
+
+        [Parameter(Mandatory=$false)]
+        [int]$RequestDelayMs = 0
     )
 
     # Refresh token before parallel operation (parallel workers get a copy of headers)
@@ -1041,6 +1368,8 @@ function Get-RestWorkflows {
         $nodes = $using:nodes
         $edges = $using:edges
         $processedCount = $using:processedCount
+        $totalRepos = $using:totalRepos
+        $RequestDelayMs = $using:RequestDelayMs
 
         # Import helper functions
         function Normalize-Null { param($Value); if ($null -eq $Value) { return "" }; return $Value }
@@ -1052,10 +1381,37 @@ function Get-RestWorkflows {
             Param([String]$Kind, [PSObject]$StartId, [PSObject]$EndId, [Hashtable]$Properties = @{})
             [pscustomobject]@{ kind = $Kind; start = @{ value = $StartId }; end = @{ value = $EndId }; properties = $Properties }
         }
+        function Invoke-RestWithRetry {
+            param([string]$Uri, [hashtable]$Headers, [string]$ApiBase = 'https://api.github.com/', [int]$MaxRetries = 3)
+            for ($r = 0; $r -lt $MaxRetries; $r++) {
+                try { return Invoke-RestMethod -Uri $Uri -Headers $Headers -Method GET -ErrorAction Stop }
+                catch {
+                    $code = $null; if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+                    if (($code -eq 403 -or $code -eq 429) -and $r -lt ($MaxRetries - 1)) {
+                        # Query the rate limit endpoint to get exact reset time
+                        $waitSec = 60
+                        try {
+                            $rlInfo = Invoke-RestMethod -Uri "${ApiBase}rate_limit" -Headers $Headers -Method GET -ErrorAction Stop
+                            $remaining = $rlInfo.resources.core.remaining
+                            $resetUnix = $rlInfo.resources.core.reset
+                            if ($remaining -eq 0 -and $resetUnix) {
+                                $waitSec = [Math]::Max($resetUnix - [DateTimeOffset]::Now.ToUnixTimeSeconds() + 2, 10)
+                            }
+                        } catch { }
+                        $resetAt = (Get-Date).AddSeconds($waitSec).ToString('HH:mm:ss')
+                        Write-Warning "Rate limit hit - waiting $([Math]::Ceiling($waitSec))s until ~$resetAt (retry $($r+1)/$MaxRetries)"
+                        Start-Sleep -Seconds $waitSec
+                        continue
+                    }
+                    throw $_
+                }
+            }
+        }
 
         try {
+            if ($RequestDelayMs -gt 0) { Start-Sleep -Milliseconds $RequestDelayMs }
             $uri = "$($Session.Uri)repos/$($repo.properties.full_name)/actions/workflows"
-            $result = Invoke-RestMethod -Uri $uri -Headers $Session.Headers -Method GET -ErrorAction Stop
+            $result = Invoke-RestWithRetry -Uri $uri -Headers $Session.Headers
 
             foreach ($workflow in $result.workflows) {
                 $props = [pscustomobject]@{
@@ -1080,7 +1436,10 @@ function Get-RestWorkflows {
             # Silently skip repos where we can't access workflows
         }
 
-        [System.Threading.Interlocked]::Increment($processedCount) | Out-Null
+        $count = [System.Threading.Interlocked]::Increment($processedCount)
+        if ($count % 500 -eq 0 -or $count -eq $totalRepos) {
+            Write-Host "[*] workflows: Processed $count/$totalRepos repositories..."
+        }
     } -ThrottleLimit $ThrottleLimit
 
     Write-Host "[*] workflows: Processed $totalRepos repositories"
@@ -1114,7 +1473,10 @@ function Get-RestEnvironmentsWithSecrets {
         [array]$Repositories,
 
         [Parameter(Mandatory=$false)]
-        [int]$ThrottleLimit = 25
+        [int]$ThrottleLimit = 25,
+
+        [Parameter(Mandatory=$false)]
+        [int]$RequestDelayMs = 0
     )
 
     # Refresh token before parallel operation
@@ -1123,6 +1485,7 @@ function Get-RestEnvironmentsWithSecrets {
     $nodes = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
     $edges = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
     $totalRepos = $Repositories.Count
+    $processedCount = [ref]0
 
     $Repositories | ForEach-Object -Parallel {
         $repo = $_
@@ -1131,6 +1494,9 @@ function Get-RestEnvironmentsWithSecrets {
         $OrgId = $using:OrgId
         $nodes = $using:nodes
         $edges = $using:edges
+        $processedCount = $using:processedCount
+        $totalRepos = $using:totalRepos
+        $RequestDelayMs = $using:RequestDelayMs
 
         function Normalize-Null { param($Value); if ($null -eq $Value) { return "" }; return $Value }
         function New-GitHoundNode {
@@ -1141,17 +1507,44 @@ function Get-RestEnvironmentsWithSecrets {
             Param([String]$Kind, [PSObject]$StartId, [PSObject]$EndId, [Hashtable]$Properties = @{})
             [pscustomobject]@{ kind = $Kind; start = @{ value = $StartId }; end = @{ value = $EndId }; properties = $Properties }
         }
+        function Invoke-RestWithRetry {
+            param([string]$Uri, [hashtable]$Headers, [string]$ApiBase = 'https://api.github.com/', [int]$MaxRetries = 3)
+            for ($r = 0; $r -lt $MaxRetries; $r++) {
+                try { return Invoke-RestMethod -Uri $Uri -Headers $Headers -Method GET -ErrorAction Stop }
+                catch {
+                    $code = $null; if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+                    if (($code -eq 403 -or $code -eq 429) -and $r -lt ($MaxRetries - 1)) {
+                        # Query the rate limit endpoint to get exact reset time
+                        $waitSec = 60
+                        try {
+                            $rlInfo = Invoke-RestMethod -Uri "${ApiBase}rate_limit" -Headers $Headers -Method GET -ErrorAction Stop
+                            $remaining = $rlInfo.resources.core.remaining
+                            $resetUnix = $rlInfo.resources.core.reset
+                            if ($remaining -eq 0 -and $resetUnix) {
+                                $waitSec = [Math]::Max($resetUnix - [DateTimeOffset]::Now.ToUnixTimeSeconds() + 2, 10)
+                            }
+                        } catch { }
+                        $resetAt = (Get-Date).AddSeconds($waitSec).ToString('HH:mm:ss')
+                        Write-Warning "Rate limit hit - waiting $([Math]::Ceiling($waitSec))s until ~$resetAt (retry $($r+1)/$MaxRetries)"
+                        Start-Sleep -Seconds $waitSec
+                        continue
+                    }
+                    throw $_
+                }
+            }
+        }
 
         try {
+            if ($RequestDelayMs -gt 0) { Start-Sleep -Milliseconds $RequestDelayMs }
             $envUri = "$($Session.Uri)repos/$($repo.properties.full_name)/environments"
-            $envResult = Invoke-RestMethod -Uri $envUri -Headers $Session.Headers -Method GET -ErrorAction Stop
+            $envResult = Invoke-RestWithRetry -Uri $envUri -Headers $Session.Headers
 
             foreach ($environment in $envResult.environments) {
                 # Fetch deployment branch policies if custom policies enabled
                 if ($environment.deployment_branch_policy.custom_branch_policies -eq $true) {
                     try {
                         $policyUri = "$($Session.Uri)repos/$($repo.properties.full_name)/environments/$($environment.name)/deployment-branch-policies"
-                        $policyResult = Invoke-RestMethod -Uri $policyUri -Headers $Session.Headers -Method GET -ErrorAction SilentlyContinue
+                        $policyResult = Invoke-RestWithRetry -Uri $policyUri -Headers $Session.Headers
 
                         foreach ($policy in $policyResult.branch_policies) {
                             $branchId = [System.BitConverter]::ToString(
@@ -1168,7 +1561,7 @@ function Get-RestEnvironmentsWithSecrets {
                 # Fetch environment secrets
                 try {
                     $secretUri = "$($Session.Uri)repos/$($repo.properties.full_name)/environments/$($environment.name)/secrets"
-                    $secretResult = Invoke-RestMethod -Uri $secretUri -Headers $Session.Headers -Method GET -ErrorAction SilentlyContinue
+                    $secretResult = Invoke-RestWithRetry -Uri $secretUri -Headers $Session.Headers
 
                     foreach ($secret in $secretResult.secrets) {
                         $secretId = "GHEnvironmentSecret_$($environment.node_id)_$($secret.name)"
@@ -1192,6 +1585,11 @@ function Get-RestEnvironmentsWithSecrets {
             }
         }
         catch { }
+
+        $count = [System.Threading.Interlocked]::Increment($processedCount)
+        if ($count % 500 -eq 0 -or $count -eq $totalRepos) {
+            Write-Host "[*] environment-secrets: Processed $count/$totalRepos repositories..."
+        }
     } -ThrottleLimit $ThrottleLimit
 
     Write-Host "[*] environment-secrets: Processed $totalRepos repositories"
@@ -1221,7 +1619,10 @@ function Get-RestSecrets {
         [array]$Repositories,
 
         [Parameter(Mandatory=$false)]
-        [int]$ThrottleLimit = 25
+        [int]$ThrottleLimit = 25,
+
+        [Parameter(Mandatory=$false)]
+        [int]$RequestDelayMs = 0
     )
 
     # Refresh token before operations
@@ -1232,9 +1633,7 @@ function Get-RestSecrets {
 
     # Fetch organization secrets (not parallel - single call)
     try {
-        $orgSecretUri = "$($Session.Uri)orgs/$OrgLogin/actions/secrets"
-        $orgSecrets = Invoke-RestMethod -Uri $orgSecretUri -Headers $Session.Headers -Method GET -ErrorAction Stop
-        Add-GitHoundRestApiCall
+        $orgSecrets = Invoke-GitHubRest -Session $Session -Path "orgs/$OrgLogin/actions/secrets"
 
         foreach ($secret in $orgSecrets.secrets) {
             $secretId = "GHOrgSecret_${OrgId}_$($secret.name)"
@@ -1259,6 +1658,8 @@ function Get-RestSecrets {
     # Fetch repository secrets (parallel)
     $repoNodes = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
     $repoEdges = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+    $secretProcessedCount = [ref]0
+    $secretTotalRepos = $Repositories.Count
 
     $Repositories | ForEach-Object -Parallel {
         $repo = $_
@@ -1267,6 +1668,9 @@ function Get-RestSecrets {
         $OrgId = $using:OrgId
         $repoNodes = $using:repoNodes
         $repoEdges = $using:repoEdges
+        $processedCount = $using:secretProcessedCount
+        $totalRepos = $using:secretTotalRepos
+        $RequestDelayMs = $using:RequestDelayMs
 
         function Normalize-Null { param($Value); if ($null -eq $Value) { return "" }; return $Value }
         function New-GitHoundNode {
@@ -1277,11 +1681,38 @@ function Get-RestSecrets {
             Param([String]$Kind, [PSObject]$StartId, [PSObject]$EndId, [Hashtable]$Properties = @{})
             [pscustomobject]@{ kind = $Kind; start = @{ value = $StartId }; end = @{ value = $EndId }; properties = $Properties }
         }
+        function Invoke-RestWithRetry {
+            param([string]$Uri, [hashtable]$Headers, [string]$ApiBase = 'https://api.github.com/', [int]$MaxRetries = 3)
+            for ($r = 0; $r -lt $MaxRetries; $r++) {
+                try { return Invoke-RestMethod -Uri $Uri -Headers $Headers -Method GET -ErrorAction Stop }
+                catch {
+                    $code = $null; if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+                    if (($code -eq 403 -or $code -eq 429) -and $r -lt ($MaxRetries - 1)) {
+                        # Query the rate limit endpoint to get exact reset time
+                        $waitSec = 60
+                        try {
+                            $rlInfo = Invoke-RestMethod -Uri "${ApiBase}rate_limit" -Headers $Headers -Method GET -ErrorAction Stop
+                            $remaining = $rlInfo.resources.core.remaining
+                            $resetUnix = $rlInfo.resources.core.reset
+                            if ($remaining -eq 0 -and $resetUnix) {
+                                $waitSec = [Math]::Max($resetUnix - [DateTimeOffset]::Now.ToUnixTimeSeconds() + 2, 10)
+                            }
+                        } catch { }
+                        $resetAt = (Get-Date).AddSeconds($waitSec).ToString('HH:mm:ss')
+                        Write-Warning "Rate limit hit - waiting $([Math]::Ceiling($waitSec))s until ~$resetAt (retry $($r+1)/$MaxRetries)"
+                        Start-Sleep -Seconds $waitSec
+                        continue
+                    }
+                    throw $_
+                }
+            }
+        }
 
         try {
+            if ($RequestDelayMs -gt 0) { Start-Sleep -Milliseconds $RequestDelayMs }
             # Fetch repo secrets
             $secretUri = "$($Session.Uri)repos/$($repo.properties.full_name)/actions/secrets"
-            $result = Invoke-RestMethod -Uri $secretUri -Headers $Session.Headers -Method GET -ErrorAction Stop
+            $result = Invoke-RestWithRetry -Uri $secretUri -Headers $Session.Headers
 
             foreach ($secret in $result.secrets) {
                 $secretId = "GHRepoSecret_$($repo.id)_$($secret.name)"
@@ -1303,7 +1734,7 @@ function Get-RestSecrets {
 
             # Fetch org secrets accessible to this repo
             $orgSecretUri = "$($Session.Uri)repos/$($repo.properties.full_name)/actions/organization-secrets"
-            $orgSecretResult = Invoke-RestMethod -Uri $orgSecretUri -Headers $Session.Headers -Method GET -ErrorAction SilentlyContinue
+            $orgSecretResult = Invoke-RestWithRetry -Uri $orgSecretUri -Headers $Session.Headers
 
             foreach ($secret in $orgSecretResult.secrets) {
                 $secretId = "GHOrgSecret_${OrgId}_$($secret.name)"
@@ -1311,6 +1742,11 @@ function Get-RestSecrets {
             }
         }
         catch { }
+
+        $count = [System.Threading.Interlocked]::Increment($processedCount)
+        if ($count % 500 -eq 0 -or $count -eq $totalRepos) {
+            Write-Host "[*] secrets: Processed $count/$totalRepos repositories..."
+        }
     } -ThrottleLimit $ThrottleLimit
 
     $null = $nodes.AddRange(@($repoNodes.ToArray()))
@@ -1340,28 +1776,63 @@ function Get-RestTeamRepoPermissions {
         [array]$Repositories,
 
         [Parameter(Mandatory=$false)]
-        [int]$ThrottleLimit = 25
+        [int]$ThrottleLimit = 25,
+
+        [Parameter(Mandatory=$false)]
+        [int]$RequestDelayMs = 0
     )
 
     # Refresh token before parallel operation
     $null = Update-GitHubSessionToken -Session $Session
 
     $edges = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+    $totalRepos = $Repositories.Count
+    $processedCount = [ref]0
 
     $Repositories | ForEach-Object -Parallel {
         $repo = $_
         $Session = $using:Session
         $OrgLogin = $using:OrgLogin
         $edges = $using:edges
+        $processedCount = $using:processedCount
+        $totalRepos = $using:totalRepos
+        $RequestDelayMs = $using:RequestDelayMs
 
         function New-GitHoundEdge {
             Param([String]$Kind, [PSObject]$StartId, [PSObject]$EndId, [Hashtable]$Properties = @{})
             [pscustomobject]@{ kind = $Kind; start = @{ value = $StartId }; end = @{ value = $EndId }; properties = $Properties }
         }
+        function Invoke-RestWithRetry {
+            param([string]$Uri, [hashtable]$Headers, [string]$ApiBase = 'https://api.github.com/', [int]$MaxRetries = 3)
+            for ($r = 0; $r -lt $MaxRetries; $r++) {
+                try { return Invoke-RestMethod -Uri $Uri -Headers $Headers -Method GET -ErrorAction Stop }
+                catch {
+                    $code = $null; if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+                    if (($code -eq 403 -or $code -eq 429) -and $r -lt ($MaxRetries - 1)) {
+                        # Query the rate limit endpoint to get exact reset time
+                        $waitSec = 60
+                        try {
+                            $rlInfo = Invoke-RestMethod -Uri "${ApiBase}rate_limit" -Headers $Headers -Method GET -ErrorAction Stop
+                            $remaining = $rlInfo.resources.core.remaining
+                            $resetUnix = $rlInfo.resources.core.reset
+                            if ($remaining -eq 0 -and $resetUnix) {
+                                $waitSec = [Math]::Max($resetUnix - [DateTimeOffset]::Now.ToUnixTimeSeconds() + 2, 10)
+                            }
+                        } catch { }
+                        $resetAt = (Get-Date).AddSeconds($waitSec).ToString('HH:mm:ss')
+                        Write-Warning "Rate limit hit - waiting $([Math]::Ceiling($waitSec))s until ~$resetAt (retry $($r+1)/$MaxRetries)"
+                        Start-Sleep -Seconds $waitSec
+                        continue
+                    }
+                    throw $_
+                }
+            }
+        }
 
         try {
+            if ($RequestDelayMs -gt 0) { Start-Sleep -Milliseconds $RequestDelayMs }
             $teamUri = "$($Session.Uri)repos/$($repo.properties.full_name)/teams"
-            $result = Invoke-RestMethod -Uri $teamUri -Headers $Session.Headers -Method GET -ErrorAction Stop
+            $result = Invoke-RestWithRetry -Uri $teamUri -Headers $Session.Headers
 
             foreach ($team in $result) {
                 # Map permission to role ID
@@ -1378,9 +1849,14 @@ function Get-RestTeamRepoPermissions {
             }
         }
         catch { }
+
+        $count = [System.Threading.Interlocked]::Increment($processedCount)
+        if ($count % 500 -eq 0 -or $count -eq $totalRepos) {
+            Write-Host "[*] team-repo-permissions: Processed $count/$totalRepos repositories..."
+        }
     } -ThrottleLimit $ThrottleLimit
 
-    Write-Host "[*] team-repo-permissions: Processed $($Repositories.Count) repositories"
+    Write-Host "[*] team-repo-permissions: Processed $totalRepos repositories"
 
     [PSCustomObject]@{
         Nodes = @()
@@ -1401,27 +1877,62 @@ function Get-RestCollaborators {
         [array]$Repositories,
 
         [Parameter(Mandatory=$false)]
-        [int]$ThrottleLimit = 25
+        [int]$ThrottleLimit = 25,
+
+        [Parameter(Mandatory=$false)]
+        [int]$RequestDelayMs = 0
     )
 
     # Refresh token before parallel operation
     $null = Update-GitHubSessionToken -Session $Session
 
     $edges = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+    $totalRepos = $Repositories.Count
+    $processedCount = [ref]0
 
     $Repositories | ForEach-Object -Parallel {
         $repo = $_
         $Session = $using:Session
         $edges = $using:edges
+        $processedCount = $using:processedCount
+        $totalRepos = $using:totalRepos
+        $RequestDelayMs = $using:RequestDelayMs
 
         function New-GitHoundEdge {
             Param([String]$Kind, [PSObject]$StartId, [PSObject]$EndId, [Hashtable]$Properties = @{})
             [pscustomobject]@{ kind = $Kind; start = @{ value = $StartId }; end = @{ value = $EndId }; properties = $Properties }
         }
+        function Invoke-RestWithRetry {
+            param([string]$Uri, [hashtable]$Headers, [string]$ApiBase = 'https://api.github.com/', [int]$MaxRetries = 3)
+            for ($r = 0; $r -lt $MaxRetries; $r++) {
+                try { return Invoke-RestMethod -Uri $Uri -Headers $Headers -Method GET -ErrorAction Stop }
+                catch {
+                    $code = $null; if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+                    if (($code -eq 403 -or $code -eq 429) -and $r -lt ($MaxRetries - 1)) {
+                        # Query the rate limit endpoint to get exact reset time
+                        $waitSec = 60
+                        try {
+                            $rlInfo = Invoke-RestMethod -Uri "${ApiBase}rate_limit" -Headers $Headers -Method GET -ErrorAction Stop
+                            $remaining = $rlInfo.resources.core.remaining
+                            $resetUnix = $rlInfo.resources.core.reset
+                            if ($remaining -eq 0 -and $resetUnix) {
+                                $waitSec = [Math]::Max($resetUnix - [DateTimeOffset]::Now.ToUnixTimeSeconds() + 2, 10)
+                            }
+                        } catch { }
+                        $resetAt = (Get-Date).AddSeconds($waitSec).ToString('HH:mm:ss')
+                        Write-Warning "Rate limit hit - waiting $([Math]::Ceiling($waitSec))s until ~$resetAt (retry $($r+1)/$MaxRetries)"
+                        Start-Sleep -Seconds $waitSec
+                        continue
+                    }
+                    throw $_
+                }
+            }
+        }
 
         try {
+            if ($RequestDelayMs -gt 0) { Start-Sleep -Milliseconds $RequestDelayMs }
             $collabUri = "$($Session.Uri)repos/$($repo.properties.full_name)/collaborators?affiliation=direct"
-            $result = Invoke-RestMethod -Uri $collabUri -Headers $Session.Headers -Method GET -ErrorAction Stop
+            $result = Invoke-RestWithRetry -Uri $collabUri -Headers $Session.Headers
 
             foreach ($collaborator in $result) {
                 # Map role_name to role ID
@@ -1438,9 +1949,14 @@ function Get-RestCollaborators {
             }
         }
         catch { }
+
+        $count = [System.Threading.Interlocked]::Increment($processedCount)
+        if ($count % 500 -eq 0 -or $count -eq $totalRepos) {
+            Write-Host "[*] collaborators: Processed $count/$totalRepos repositories..."
+        }
     } -ThrottleLimit $ThrottleLimit
 
-    Write-Host "[*] collaborators: Processed $($Repositories.Count) repositories"
+    Write-Host "[*] collaborators: Processed $totalRepos repositories"
 
     [PSCustomObject]@{
         Nodes = @()
@@ -1468,9 +1984,7 @@ function Get-RestSecretScanningAlerts {
     $edges = New-Object System.Collections.ArrayList
 
     try {
-        $alertUri = "$($Session.Uri)orgs/$OrgLogin/secret-scanning/alerts?state=open&per_page=100"
-        $alerts = Invoke-RestMethod -Uri $alertUri -Headers $Session.Headers -Method GET -ErrorAction Stop
-        Add-GitHoundRestApiCall
+        $alerts = Invoke-GitHubRest -Session $Session -Path "orgs/$OrgLogin/secret-scanning/alerts?state=open&per_page=100"
 
         foreach ($alert in $alerts) {
             $alertId = "GHSecretScanningAlert_${OrgId}_$($alert.number)"
@@ -1527,9 +2041,7 @@ function Get-RestAppInstallations {
     $edges = New-Object System.Collections.ArrayList
 
     try {
-        $appUri = "$($Session.Uri)orgs/$OrgLogin/installations?per_page=100"
-        $result = Invoke-RestMethod -Uri $appUri -Headers $Session.Headers -Method GET -ErrorAction Stop
-        Add-GitHoundRestApiCall
+        $result = Invoke-GitHubRest -Session $Session -Path "orgs/$OrgLogin/installations?per_page=100"
 
         foreach ($installation in $result.installations) {
             $installId = "GHAppInstallation_${OrgId}_$($installation.id)"
@@ -2714,6 +3226,9 @@ function Invoke-GitHoundGraphQL {
         [switch]$Metrics,
 
         [Parameter(Mandatory = $false)]
+        [switch]$Paced,
+
+        [Parameter(Mandatory = $false)]
         [int]$BatchSize = 10,
 
         [Parameter(Mandatory = $false)]
@@ -2758,6 +3273,7 @@ function Invoke-GitHoundGraphQL {
         # Restore batch settings from checkpoint if available
         if ($checkpoint.batchSize) { $BatchSize = $checkpoint.batchSize }
         if ($checkpoint.throttleLimit) { $ThrottleLimit = $checkpoint.throttleLimit }
+        if ($checkpoint.paced) { $Paced = [switch]$true }
     } else {
         if ($Collect -contains 'All') {
             $Collect = @('Users', 'Teams', 'Repos', 'Branches', 'Environments',
@@ -2817,6 +3333,7 @@ function Invoke-GitHoundGraphQL {
             phaseProgress = $phaseProgress
             batchSize = $BatchSize
             throttleLimit = $ThrottleLimit
+            paced = [bool]$Paced
         }
         Save-GitHoundCheckpoint -OutputFolder $outputFolder -Checkpoint $checkpointData
     }
@@ -2968,9 +3485,20 @@ function Invoke-GitHoundGraphQL {
     if ($Collect -contains 'Environments' -and $collectedRepos.Count -gt 0) {
         if ($completedPhases -notcontains 'environments') {
             Start-GitHoundPhaseMetrics -PhaseName 'environments'
+            Wait-GitHubRateLimit -Session $Session -MinRemaining 500
             Write-Host "[*] Enumerating Repository Environments (REST API with parallel processing)"
 
-            $envSecrets = Get-RestEnvironmentsWithSecrets -Session $Session -OrgLogin $orgLogin -OrgId $orgId -Repositories $collectedRepos -ThrottleLimit $ThrottleLimit
+            if ($Paced) {
+                $envSecrets = Invoke-PacedRestPhase -Session $Session -Repositories $collectedRepos `
+                    -CallsPerRepo 3 -ThrottleLimit $ThrottleLimit -PhaseName 'environments' `
+                    -InvokePhase {
+                        param($ChunkRepos, $DelayMs)
+                        Get-RestEnvironmentsWithSecrets -Session $Session -OrgLogin $orgLogin -OrgId $orgId `
+                            -Repositories $ChunkRepos -ThrottleLimit $ThrottleLimit -RequestDelayMs $DelayMs
+                    }
+            } else {
+                $envSecrets = Get-RestEnvironmentsWithSecrets -Session $Session -OrgLogin $orgLogin -OrgId $orgId -Repositories $collectedRepos -ThrottleLimit $ThrottleLimit
+            }
 
             $envFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'environments' -Tier 2 -Nodes $envSecrets.Nodes -Edges $envSecrets.Edges
             $null = $writtenFiles.Add(@{ File = $envFile; Tier = 2; Phase = 'environments' })
@@ -2999,9 +3527,20 @@ function Invoke-GitHoundGraphQL {
     if ($Collect -contains 'Workflows' -and $collectedRepos.Count -gt 0) {
         if ($completedPhases -notcontains 'workflows') {
             Start-GitHoundPhaseMetrics -PhaseName 'workflows'
+            Wait-GitHubRateLimit -Session $Session -MinRemaining 500
             Write-Host "[*] Enumerating Repository Workflows (REST API with parallel processing)"
 
-            $workflows = Get-RestWorkflows -Session $Session -Repositories $collectedRepos -ThrottleLimit $ThrottleLimit
+            if ($Paced) {
+                $workflows = Invoke-PacedRestPhase -Session $Session -Repositories $collectedRepos `
+                    -CallsPerRepo 1 -ThrottleLimit $ThrottleLimit -PhaseName 'workflows' `
+                    -InvokePhase {
+                        param($ChunkRepos, $DelayMs)
+                        Get-RestWorkflows -Session $Session -Repositories $ChunkRepos `
+                            -ThrottleLimit $ThrottleLimit -RequestDelayMs $DelayMs
+                    }
+            } else {
+                $workflows = Get-RestWorkflows -Session $Session -Repositories $collectedRepos -ThrottleLimit $ThrottleLimit
+            }
 
             $wfFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'workflows' -Tier 2 -Nodes $workflows.Nodes -Edges $workflows.Edges
             $null = $writtenFiles.Add(@{ File = $wfFile; Tier = 2; Phase = 'workflows' })
@@ -3030,9 +3569,20 @@ function Invoke-GitHoundGraphQL {
     if ($Collect -contains 'Secrets' -and $collectedRepos.Count -gt 0) {
         if ($completedPhases -notcontains 'secrets') {
             Start-GitHoundPhaseMetrics -PhaseName 'secrets'
+            Wait-GitHubRateLimit -Session $Session -MinRemaining 500
             Write-Host "[*] Enumerating Organization and Repository Secrets (REST API)"
 
-            $secrets = Get-RestSecrets -Session $Session -OrgLogin $orgLogin -OrgId $orgId -Repositories $collectedRepos -ThrottleLimit $ThrottleLimit
+            if ($Paced) {
+                $secrets = Invoke-PacedRestPhase -Session $Session -Repositories $collectedRepos `
+                    -CallsPerRepo 2 -ThrottleLimit $ThrottleLimit -PhaseName 'secrets' `
+                    -InvokePhase {
+                        param($ChunkRepos, $DelayMs)
+                        Get-RestSecrets -Session $Session -OrgLogin $orgLogin -OrgId $orgId `
+                            -Repositories $ChunkRepos -ThrottleLimit $ThrottleLimit -RequestDelayMs $DelayMs
+                    }
+            } else {
+                $secrets = Get-RestSecrets -Session $Session -OrgLogin $orgLogin -OrgId $orgId -Repositories $collectedRepos -ThrottleLimit $ThrottleLimit
+            }
 
             $secretFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'secrets' -Tier 2 -Nodes $secrets.Nodes -Edges $secrets.Edges
             $null = $writtenFiles.Add(@{ File = $secretFile; Tier = 2; Phase = 'secrets' })
@@ -3123,9 +3673,20 @@ function Invoke-GitHoundGraphQL {
     if ($Collect -contains 'TeamRoles' -and $collectedRepos.Count -gt 0) {
         if ($completedPhases -notcontains 'teamroles') {
             Start-GitHoundPhaseMetrics -PhaseName 'teamroles'
+            Wait-GitHubRateLimit -Session $Session -MinRemaining 500
             Write-Host "[*] Enumerating Team Repository Permissions (REST API with parallel processing)"
 
-            $teamRoles = Get-RestTeamRepoPermissions -Session $Session -OrgLogin $orgLogin -Repositories $collectedRepos -ThrottleLimit $ThrottleLimit
+            if ($Paced) {
+                $teamRoles = Invoke-PacedRestPhase -Session $Session -Repositories $collectedRepos `
+                    -CallsPerRepo 1 -ThrottleLimit $ThrottleLimit -PhaseName 'teamroles' `
+                    -InvokePhase {
+                        param($ChunkRepos, $DelayMs)
+                        Get-RestTeamRepoPermissions -Session $Session -OrgLogin $orgLogin `
+                            -Repositories $ChunkRepos -ThrottleLimit $ThrottleLimit -RequestDelayMs $DelayMs
+                    }
+            } else {
+                $teamRoles = Get-RestTeamRepoPermissions -Session $Session -OrgLogin $orgLogin -Repositories $collectedRepos -ThrottleLimit $ThrottleLimit
+            }
 
             $trFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'teamroles' -Tier 3 -Nodes $teamRoles.Nodes -Edges $teamRoles.Edges
             $null = $writtenFiles.Add(@{ File = $trFile; Tier = 3; Phase = 'teamroles' })
@@ -3152,9 +3713,20 @@ function Invoke-GitHoundGraphQL {
     if ($Collect -contains 'Collaborators' -and $collectedRepos.Count -gt 0) {
         if ($completedPhases -notcontains 'collaborators') {
             Start-GitHoundPhaseMetrics -PhaseName 'collaborators'
+            Wait-GitHubRateLimit -Session $Session -MinRemaining 500
             Write-Host "[*] Enumerating Repository Collaborators (REST API with parallel processing)"
 
-            $collaborators = Get-RestCollaborators -Session $Session -Repositories $collectedRepos -ThrottleLimit $ThrottleLimit
+            if ($Paced) {
+                $collaborators = Invoke-PacedRestPhase -Session $Session -Repositories $collectedRepos `
+                    -CallsPerRepo 1 -ThrottleLimit $ThrottleLimit -PhaseName 'collaborators' `
+                    -InvokePhase {
+                        param($ChunkRepos, $DelayMs)
+                        Get-RestCollaborators -Session $Session -Repositories $ChunkRepos `
+                            -ThrottleLimit $ThrottleLimit -RequestDelayMs $DelayMs
+                    }
+            } else {
+                $collaborators = Get-RestCollaborators -Session $Session -Repositories $collectedRepos -ThrottleLimit $ThrottleLimit
+            }
 
             $collabFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'collaborators' -Tier 3 -Nodes $collaborators.Nodes -Edges $collaborators.Edges
             $null = $writtenFiles.Add(@{ File = $collabFile; Tier = 3; Phase = 'collaborators' })
@@ -3181,6 +3753,7 @@ function Invoke-GitHoundGraphQL {
     if ($Collect -contains 'SecretScanning') {
         if ($completedPhases -notcontains 'secretscanning') {
             Start-GitHoundPhaseMetrics -PhaseName 'secretscanning'
+            Wait-GitHubRateLimit -Session $Session -MinRemaining 100
             Write-Host "[*] Enumerating Secret Scanning Alerts (REST API)"
 
             $secretAlerts = Get-RestSecretScanningAlerts -Session $Session -OrgLogin $orgLogin -OrgId $orgId
@@ -3212,6 +3785,7 @@ function Invoke-GitHoundGraphQL {
     if ($Collect -contains 'AppInstallations') {
         if ($completedPhases -notcontains 'appinstallations') {
             Start-GitHoundPhaseMetrics -PhaseName 'appinstallations'
+            Wait-GitHubRateLimit -Session $Session -MinRemaining 100
             Write-Host "[*] Enumerating GitHub App Installations (REST API)"
 
             $appInstalls = Get-RestAppInstallations -Session $Session -OrgLogin $orgLogin -OrgId $orgId
