@@ -1,6 +1,127 @@
+# ===========================================
+# Metrics Tracking for Performance Analysis
+# ===========================================
+$script:GitHoundMetrics = @{
+    Enabled = $false
+    CurrentPhase = $null
+    Phases = @{}
+    TotalApiCalls = 0
+    TotalStartTime = $null
+}
+
+function Initialize-GitHoundMetrics {
+    <#
+    .SYNOPSIS
+        Initializes the metrics tracking system.
+    #>
+    $script:GitHoundMetrics = @{
+        Enabled = $true
+        CurrentPhase = $null
+        Phases = @{}
+        TotalApiCalls = 0
+        TotalStartTime = [System.Diagnostics.Stopwatch]::StartNew()
+    }
+}
+
+function Start-GitHoundPhaseMetrics {
+    <#
+    .SYNOPSIS
+        Starts tracking metrics for a specific phase.
+    #>
+    param([string]$PhaseName)
+
+    if (-not $script:GitHoundMetrics.Enabled) { return }
+
+    $script:GitHoundMetrics.CurrentPhase = $PhaseName
+    $script:GitHoundMetrics.Phases[$PhaseName] = @{
+        StartTime = [System.Diagnostics.Stopwatch]::StartNew()
+        ApiCalls = 0
+        RestCalls = 0
+        GraphQLCalls = 0
+    }
+}
+
+function Add-GitHoundApiCall {
+    <#
+    .SYNOPSIS
+        Increments the API call counter for the current phase.
+    #>
+    param(
+        [ValidateSet('REST', 'GraphQL')]
+        [string]$Type = 'REST'
+    )
+
+    if (-not $script:GitHoundMetrics.Enabled) { return }
+
+    $script:GitHoundMetrics.TotalApiCalls++
+
+    $phase = $script:GitHoundMetrics.CurrentPhase
+    if ($phase -and $script:GitHoundMetrics.Phases.ContainsKey($phase)) {
+        $script:GitHoundMetrics.Phases[$phase].ApiCalls++
+        if ($Type -eq 'REST') {
+            $script:GitHoundMetrics.Phases[$phase].RestCalls++
+        } else {
+            $script:GitHoundMetrics.Phases[$phase].GraphQLCalls++
+        }
+    }
+}
+
+function Stop-GitHoundPhaseMetrics {
+    <#
+    .SYNOPSIS
+        Stops tracking metrics for the current phase and outputs results.
+    #>
+    param([string]$PhaseName)
+
+    if (-not $script:GitHoundMetrics.Enabled) { return }
+
+    if ($script:GitHoundMetrics.Phases.ContainsKey($PhaseName)) {
+        $phase = $script:GitHoundMetrics.Phases[$PhaseName]
+        $phase.StartTime.Stop()
+        $phase.Duration = $phase.StartTime.Elapsed
+
+        $duration = $phase.Duration.ToString("mm\:ss\.fff")
+        Write-Host "    [Metrics] $PhaseName completed: $($phase.ApiCalls) API calls ($($phase.RestCalls) REST, $($phase.GraphQLCalls) GraphQL) in $duration" -ForegroundColor Cyan
+    }
+
+    $script:GitHoundMetrics.CurrentPhase = $null
+}
+
+function Write-GitHoundMetricsSummary {
+    <#
+    .SYNOPSIS
+        Outputs a summary table of all phase metrics.
+    #>
+    if (-not $script:GitHoundMetrics.Enabled) { return }
+
+    $script:GitHoundMetrics.TotalStartTime.Stop()
+    $totalDuration = $script:GitHoundMetrics.TotalStartTime.Elapsed
+
+    Write-Host ""
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host "COLLECTION METRICS SUMMARY" -ForegroundColor Cyan
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host ("{0,-20} {1,10} {2,10} {3,10} {4,12}" -f "Phase", "REST", "GraphQL", "Total", "Duration") -ForegroundColor Yellow
+    Write-Host ("{0,-20} {1,10} {2,10} {3,10} {4,12}" -f "-----", "----", "-------", "-----", "--------") -ForegroundColor Yellow
+
+    $sortedPhases = $script:GitHoundMetrics.Phases.GetEnumerator() | Sort-Object { $_.Value.Duration } -Descending
+
+    foreach ($entry in $sortedPhases) {
+        $phase = $entry.Value
+        $duration = if ($phase.Duration) { $phase.Duration.ToString("mm\:ss\.fff") } else { "N/A" }
+        Write-Host ("{0,-20} {1,10} {2,10} {3,10} {4,12}" -f $entry.Key, $phase.RestCalls, $phase.GraphQLCalls, $phase.ApiCalls, $duration)
+    }
+
+    Write-Host ""
+    Write-Host ("{0,-20} {1,10} {2,10} {3,10} {4,12}" -f "TOTAL", "", "", $script:GitHoundMetrics.TotalApiCalls, $totalDuration.ToString("mm\:ss\.fff")) -ForegroundColor Green
+    Write-Host ""
+    Write-Host "=============================================" -ForegroundColor Cyan
+}
+
 function Get-GitHoundFunctionBundle {
     [OutputType([hashtable])]
-    param() 
+    param()
     $GitHoundFunctions = @{}
     $functionsToRegister = @(
         'Normalize-Null',
@@ -166,6 +287,8 @@ function Invoke-GithubRestMethod {
                         $Response = Invoke-WebRequest -Uri "$($Session.Uri)$($Path)" -Headers $Session.Headers -Method $Method -ErrorAction Stop
                     }
                     $requestSuccessful = $true
+                    # Track API call for metrics
+                    Add-GitHoundApiCall -Type 'REST'
                 }
                 catch {
                     $httpException = $_.ErrorDetails | ConvertFrom-Json
@@ -258,6 +381,8 @@ function Invoke-GitHubGraphQL
         try {
             $result = Invoke-RestMethod @fparams
             $requestSuccessful = $true
+            # Track API call for metrics
+            Add-GitHoundApiCall -Type 'GraphQL'
         }
         catch {
             $httpException = $_.ErrorDetails | ConvertFrom-Json
@@ -3447,6 +3572,11 @@ function Invoke-GitHound
         - 100: Default, good balance for most scenarios
         - 500: Less frequent (faster, for large orgs with reliable connections)
 
+    .PARAMETER Metrics
+        If specified, enables performance metrics tracking. Displays API call counts and timing
+        for each collection phase, plus a summary table at the end showing total calls and
+        duration per phase. Useful for identifying bottlenecks and optimization opportunities.
+
     .EXAMPLE
         $session = New-GithubSession -OrganizationName "my-org" -Token $token
         Invoke-GitHound -Session $session
@@ -3471,6 +3601,10 @@ function Invoke-GitHound
     .EXAMPLE
         # Resume a previous run that was interrupted
         Invoke-GitHound -Session $session -Resume './20240202180743_O_kgDOCoV2OQ/'
+
+    .EXAMPLE
+        # Enable metrics to see API calls and timing per phase
+        Invoke-GitHound -Session $session -Metrics
     #>
     [CmdletBinding()]
     Param(
@@ -3507,8 +3641,17 @@ function Invoke-GitHound
         [string]$Resume = '',
 
         [Parameter(Mandatory = $false)]
-        [int]$CheckpointBatchSize = 100
+        [int]$CheckpointBatchSize = 100,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$Metrics
     )
+
+    # Initialize metrics tracking if enabled
+    if ($Metrics) {
+        Initialize-GitHoundMetrics
+        Write-Host "[*] Metrics tracking enabled" -ForegroundColor Cyan
+    }
 
     # Track completed phases for checkpoint/resume
     $completedPhases = @()
@@ -3582,8 +3725,10 @@ function Invoke-GitHound
     # ===========================================
     # Organization Phase (ALWAYS runs - Tier 1)
     # ===========================================
+    Start-GitHoundPhaseMetrics -PhaseName 'organization'
     Write-Host "[*] Starting GitHound for $($Session.OrganizationName)"
     $org = Git-HoundOrganization -Session $Session
+    Stop-GitHoundPhaseMetrics -PhaseName 'organization'
 
     # Setup output folder (new run or resume)
     if ($Resume -eq '') {
@@ -3664,6 +3809,7 @@ function Invoke-GitHound
     # ===========================================
     if ($Collect -contains 'Users') {
         if ($completedPhases -notcontains 'users') {
+            Start-GitHoundPhaseMetrics -PhaseName 'users'
             Write-Host "[*] Enumerating Organization Users"
 
             # Load existing progress if resuming mid-phase
@@ -3837,6 +3983,7 @@ function Invoke-GitHound
             if (Test-Path $incrementalFile) { Remove-Item $incrementalFile -Force }
             $phaseProgress.Remove('users')
 
+            Stop-GitHoundPhaseMetrics -PhaseName 'users'
             $completedPhases += 'users'
             Save-Checkpoint
         } else {
@@ -3857,6 +4004,7 @@ function Invoke-GitHound
     # ===========================================
     if ($Collect -contains 'Teams') {
         if ($completedPhases -notcontains 'teams') {
+            Start-GitHoundPhaseMetrics -PhaseName 'teams'
             Write-Host "[*] Enumerating Organization Teams"
 
             # Load existing progress if resuming mid-phase
@@ -3995,6 +4143,7 @@ function Invoke-GitHound
             if (Test-Path $incrementalFile) { Remove-Item $incrementalFile -Force }
             $phaseProgress.Remove('teams')
 
+            Stop-GitHoundPhaseMetrics -PhaseName 'teams'
             $completedPhases += 'teams'
             Save-Checkpoint
         } else {
@@ -4017,6 +4166,7 @@ function Invoke-GitHound
     $repos = $null
     if ($Collect -contains 'Repos') {
         if ($completedPhases -notcontains 'repos') {
+            Start-GitHoundPhaseMetrics -PhaseName 'repos'
             Write-Host "[*] Enumerating Organization Repositories"
 
             # Load existing progress if resuming mid-phase
@@ -4210,6 +4360,7 @@ function Invoke-GitHound
             if (Test-Path $incrementalFile) { Remove-Item $incrementalFile -Force }
             $phaseProgress.Remove('repos')
 
+            Stop-GitHoundPhaseMetrics -PhaseName 'repos'
             $completedPhases += 'repos'
             Save-Checkpoint
         } else {
@@ -4235,6 +4386,7 @@ function Invoke-GitHound
     # ===========================================
     if ($Collect -contains 'Branches' -and $repos) {
         if ($completedPhases -notcontains 'branches') {
+            Start-GitHoundPhaseMetrics -PhaseName 'branches'
             Write-Host "[*] Enumerating Organization Branches"
 
             # Load existing progress if resuming mid-phase
@@ -4303,6 +4455,7 @@ function Invoke-GitHound
             if (Test-Path $incrementalFile) { Remove-Item $incrementalFile -Force }
             $phaseProgress.Remove('branches')
 
+            Stop-GitHoundPhaseMetrics -PhaseName 'branches'
             $completedPhases += 'branches'
             Save-Checkpoint
         } else {
@@ -4323,6 +4476,7 @@ function Invoke-GitHound
     # ===========================================
     if ($Collect -contains 'Workflows' -and $repos) {
         if ($completedPhases -notcontains 'workflows') {
+            Start-GitHoundPhaseMetrics -PhaseName 'workflows'
             Write-Host "[*] Enumerating Organization Workflows"
 
             # Load existing progress if resuming mid-phase
@@ -4390,6 +4544,7 @@ function Invoke-GitHound
             if (Test-Path $incrementalFile) { Remove-Item $incrementalFile -Force }
             $phaseProgress.Remove('workflows')
 
+            Stop-GitHoundPhaseMetrics -PhaseName 'workflows'
             $completedPhases += 'workflows'
             Save-Checkpoint
         } else {
@@ -4410,6 +4565,7 @@ function Invoke-GitHound
     # ===========================================
     if ($Collect -contains 'Environments' -and $repos) {
         if ($completedPhases -notcontains 'environments') {
+            Start-GitHoundPhaseMetrics -PhaseName 'environments'
             Write-Host "[*] Enumerating Organization Environments"
 
             # Load existing progress if resuming mid-phase
@@ -4477,6 +4633,7 @@ function Invoke-GitHound
             if (Test-Path $incrementalFile) { Remove-Item $incrementalFile -Force }
             $phaseProgress.Remove('environments')
 
+            Stop-GitHoundPhaseMetrics -PhaseName 'environments'
             $completedPhases += 'environments'
             Save-Checkpoint
         } else {
@@ -4497,6 +4654,7 @@ function Invoke-GitHound
     # ===========================================
     if ($Collect -contains 'Secrets' -and $repos) {
         if ($completedPhases -notcontains 'secrets') {
+            Start-GitHoundPhaseMetrics -PhaseName 'secrets'
             Write-Host "[*] Enumerating Organization Secrets"
 
             # Load existing progress if resuming mid-phase
@@ -4564,6 +4722,7 @@ function Invoke-GitHound
             if (Test-Path $incrementalFile) { Remove-Item $incrementalFile -Force }
             $phaseProgress.Remove('secrets')
 
+            Stop-GitHoundPhaseMetrics -PhaseName 'secrets'
             $completedPhases += 'secrets'
             Save-Checkpoint
         } else {
@@ -4584,6 +4743,7 @@ function Invoke-GitHound
     # ===========================================
     if ($Collect -contains 'SecretScanning') {
         if ($completedPhases -notcontains 'secretscanning') {
+            Start-GitHoundPhaseMetrics -PhaseName 'secretscanning'
             Write-Host "[*] Enumerating Secret Scanning Alerts"
             $secretalerts = $org.nodes[0] | Git-HoundSecretScanningAlert -Session $Session
 
@@ -4599,6 +4759,7 @@ function Invoke-GitHound
             if ($secretalerts.nodes) { $null = $allNodes.AddRange(@($secretalerts.nodes)) }
             if ($secretalerts.edges) { $null = $allEdges.AddRange(@($secretalerts.edges)) }
 
+            Stop-GitHoundPhaseMetrics -PhaseName 'secretscanning'
             $completedPhases += 'secretscanning'
             Save-Checkpoint
         } else {
@@ -4619,6 +4780,7 @@ function Invoke-GitHound
     # ===========================================
     if ($Collect -contains 'AppInstallations') {
         if ($completedPhases -notcontains 'appinstallations') {
+            Start-GitHoundPhaseMetrics -PhaseName 'appinstallations'
             Write-Host "[*] Enumerating App Installations"
             $appInstallations = $org.nodes[0] | Git-HoundAppInstallation -Session $Session
 
@@ -4634,6 +4796,7 @@ function Invoke-GitHound
             if ($appInstallations.nodes) { $null = $allNodes.AddRange(@($appInstallations.nodes)) }
             if ($appInstallations.edges) { $null = $allEdges.AddRange(@($appInstallations.edges)) }
 
+            Stop-GitHoundPhaseMetrics -PhaseName 'appinstallations'
             $completedPhases += 'appinstallations'
             Save-Checkpoint
         } else {
@@ -4654,6 +4817,7 @@ function Invoke-GitHound
     # ===========================================
     if ($Collect -contains 'TeamRoles') {
         if ($completedPhases -notcontains 'teamroles') {
+            Start-GitHoundPhaseMetrics -PhaseName 'teamroles'
             Write-Host "[*] Enumerating Team Roles"
             $teamroles = $org.nodes[0] | Git-HoundTeamRole -Session $Session -ThrottleLimit $ThrottleLimit
 
@@ -4669,6 +4833,7 @@ function Invoke-GitHound
             if ($teamroles.nodes) { $null = $allNodes.AddRange(@($teamroles.nodes)) }
             if ($teamroles.edges) { $null = $allEdges.AddRange(@($teamroles.edges)) }
 
+            Stop-GitHoundPhaseMetrics -PhaseName 'teamroles'
             $completedPhases += 'teamroles'
             Save-Checkpoint
         } else {
@@ -4691,6 +4856,7 @@ function Invoke-GitHound
         if ($completedPhases -notcontains 'orgroles') {
             # FIX: Wrap phase in try/catch so collection can continue if this phase fails
             # This prevents API errors or permission issues from crashing the entire collection
+            Start-GitHoundPhaseMetrics -PhaseName 'orgroles'
             try {
                 Write-Host "[*] Enumerating Organization Roles"
                 # Pass cached members if available (from Users phase) to avoid duplicate API call
@@ -4709,6 +4875,7 @@ function Invoke-GitHound
                 if ($orgroles.nodes) { $null = $allNodes.AddRange(@($orgroles.nodes)) }
                 if ($orgroles.edges) { $null = $allEdges.AddRange(@($orgroles.edges)) }
 
+                Stop-GitHoundPhaseMetrics -PhaseName 'orgroles'
                 $completedPhases += 'orgroles'
                 Save-Checkpoint
             } catch {
@@ -4735,6 +4902,7 @@ function Invoke-GitHound
         if ($completedPhases -notcontains 'reporoles') {
             # FIX: Wrap phase in try/catch so collection can continue if this phase fails
             # This prevents API errors or permission issues from crashing the entire collection
+            Start-GitHoundPhaseMetrics -PhaseName 'reporoles'
             try {
                 Write-Host "[*] Enumerating Repository Roles"
                 $reporoles = $org.nodes[0] | Git-HoundRepositoryRole -Session $Session -ThrottleLimit $ThrottleLimit
@@ -4751,6 +4919,7 @@ function Invoke-GitHound
                 if ($reporoles.nodes) { $null = $allNodes.AddRange(@($reporoles.nodes)) }
                 if ($reporoles.edges) { $null = $allEdges.AddRange(@($reporoles.edges)) }
 
+                Stop-GitHoundPhaseMetrics -PhaseName 'reporoles'
                 $completedPhases += 'reporoles'
                 Save-Checkpoint
             } catch {
@@ -4775,6 +4944,7 @@ function Invoke-GitHound
     # ===========================================
     if ($Collect -contains 'SAML') {
         if ($completedPhases -notcontains 'saml') {
+            Start-GitHoundPhaseMetrics -PhaseName 'saml'
             Write-Host "[*] Enumerating SAML Identity Provider"
             $saml = Git-HoundGraphQlSamlProvider -Session $Session
 
@@ -4792,6 +4962,7 @@ function Invoke-GitHound
             # reference external IdP nodes (OktaUser, AZUser, etc.) that may not exist
             # in the BloodHound graph, causing import failures.
 
+            Stop-GitHoundPhaseMetrics -PhaseName 'saml'
             $completedPhases += 'saml'
             Save-Checkpoint
         } else {
@@ -4901,6 +5072,9 @@ function Invoke-GitHound
         Remove-Item -Path $outputFolder -Recurse -Force
         Write-Host "[+] Output folder removed. Only zip archive remains."
     }
+
+    # Output metrics summary if enabled
+    Write-GitHoundMetricsSummary
 
     Write-Host ""
     Write-Host "[*] GitHound collection complete!"
