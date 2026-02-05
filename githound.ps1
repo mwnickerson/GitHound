@@ -1326,6 +1326,10 @@ function Git-HoundOrganization
     $output = [PSCustomObject]@{
         Nodes = $nodes
         Edges = $edges
+        # Cache raw API responses for reuse by other phases (avoids duplicate API calls)
+        CachedData = @{
+            ActionsPermissions = $actions
+        }
     }
 
     Write-Output $output
@@ -2258,7 +2262,10 @@ function Git-HoundOrganizationRole
         [int]$UserLimit = 0,
 
         [Parameter(Mandatory = $false)]
-        [int]$ThrottleLimit = 25
+        [int]$ThrottleLimit = 25,
+
+        [Parameter(Mandatory = $false)]
+        [PSObject[]]$Members = $null
     )
 
     $nodes = New-Object System.Collections.ArrayList
@@ -2409,7 +2416,14 @@ function Git-HoundOrganizationRole
 
     # Need to add custom role membership here
     # This is a great place to parallelize, because we must enumerate users and then check their memberships individually
-    $members = Invoke-GithubRestMethod -Session $Session -Path "orgs/$($organization.Properties.login)/members"
+    # Use cached members if provided (avoids duplicate API call from Users phase)
+    if ($null -eq $Members) {
+        Write-Verbose "Fetching members (no cached data provided)"
+        $members = Invoke-GithubRestMethod -Session $Session -Path "orgs/$($organization.Properties.login)/members"
+    } else {
+        Write-Verbose "Using cached members data ($($Members.Count) members)"
+        $members = $Members
+    }
     if ($UserLimit -gt 0) {
         $members = $members | Select-Object -First $UserLimit
     }
@@ -3642,6 +3656,9 @@ function Invoke-GitHound
     if ($org.nodes) { $null = $allNodes.AddRange(@($org.nodes)) }
     if ($org.edges) { $null = $allEdges.AddRange(@($org.edges)) }
 
+    # Cache for sharing data between phases (avoids duplicate API calls)
+    $cachedMembers = New-Object System.Collections.ArrayList
+
     # ===========================================
     # Users Phase (Tier 1)
     # ===========================================
@@ -3722,6 +3739,9 @@ function Invoke-GitHound
                     $hasMore = $false
                     continue
                 }
+
+                # Cache raw member data for reuse by OrgRoles phase (avoids duplicate API call)
+                $null = $cachedMembers.AddRange(@($pageMembers))
 
                 # Apply UserLimit if specified
                 if ($UserLimit -gt 0) {
@@ -4020,8 +4040,9 @@ function Invoke-GitHound
                 }
             }
 
-            # Fetch actions permissions (needed for processing)
-            $actions = Invoke-GithubRestMethod -Session $Session -Path "orgs/$($org.nodes[0].Properties.login)/actions/permissions"
+            # Use cached actions permissions from Organization phase (avoids duplicate API call)
+            Write-Verbose "[*] Using cached actions permissions from Organization phase"
+            $actions = $org.CachedData.ActionsPermissions
             $enabledRepos = $null
             if ($actions.enabled_repositories -ne 'all') {
                 $enabledRepos = (Invoke-GithubRestMethod -Session $Session -Path "orgs/$($org.nodes[0].Properties.login)/actions/permissions/repositories").repositories.node_id
@@ -4672,7 +4693,9 @@ function Invoke-GitHound
             # This prevents API errors or permission issues from crashing the entire collection
             try {
                 Write-Host "[*] Enumerating Organization Roles"
-                $orgroles = $org.nodes[0] | Git-HoundOrganizationRole -Session $Session -UserLimit $UserLimit -ThrottleLimit $ThrottleLimit
+                # Pass cached members if available (from Users phase) to avoid duplicate API call
+                $membersParam = if ($cachedMembers.Count -gt 0) { @{ Members = $cachedMembers } } else { @{} }
+                $orgroles = $org.nodes[0] | Git-HoundOrganizationRole -Session $Session -UserLimit $UserLimit -ThrottleLimit $ThrottleLimit @membersParam
 
                 $orNodes = New-Object System.Collections.ArrayList
                 $orEdges = New-Object System.Collections.ArrayList
