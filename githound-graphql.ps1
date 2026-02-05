@@ -3317,10 +3317,3 @@ function Invoke-GitHoundGraphQL {
     Write-Host "[+] GitHound GraphQL collection complete!" -ForegroundColor Green
 }
 
-# Export functions
-Export-ModuleMember -Function @(
-    'New-GithubSession',
-    'New-GitHubJwtSession',
-    'Invoke-GitHubGraphQL',
-    'Invoke-GitHoundGraphQL'
-)
