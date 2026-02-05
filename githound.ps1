@@ -4764,8 +4764,10 @@ function Invoke-GitHound
                 -PhaseName 'saml' -Tier 4 -Nodes $samlNodes -Edges $samlEdges
             $null = $writtenFiles.Add(@{ File = $samlFile; Tier = 4; Phase = 'saml' })
 
-            if ($saml.nodes) { $null = $allNodes.AddRange(@($saml.nodes)) }
-            if ($saml.edges) { $null = $allEdges.AddRange(@($saml.edges)) }
+            # NOTE: SAML data is NOT added to combined output (kept in separate file)
+            # This matches the original og-githound.ps1 behavior because SAML edges
+            # reference external IdP nodes (OktaUser, AZUser, etc.) that may not exist
+            # in the BloodHound graph, causing import failures.
 
             $completedPhases += 'saml'
             Save-Checkpoint
@@ -4773,12 +4775,8 @@ function Invoke-GitHound
             Write-Host "[*] Skipping saml phase (already completed)"
             $samlFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_saml.json"
             $null = $writtenFiles.Add(@{ File = $samlFile; Tier = 4; Phase = 'saml' })
-            # FIX: Load data from existing file so combined output includes this phase's data
-            $existingData = Read-GitHoundPhaseData -FilePath $samlFile
-            if ($existingData) {
-                if ($existingData.Nodes) { $null = $allNodes.AddRange(@($existingData.Nodes)) }
-                if ($existingData.Edges) { $null = $allEdges.AddRange(@($existingData.Edges)) }
-            }
+            # NOTE: SAML data is NOT loaded into combined output (kept in separate file)
+            # This matches the original og-githound.ps1 behavior.
         }
     }
 
@@ -4837,14 +4835,16 @@ function Invoke-GitHound
     }
 
     if ($tier4Files.Count -gt 0) {
-        Write-Host "Tier 4 - SAML (upload last):"
+        Write-Host "Tier 4 - SAML (SEPARATE - only upload if you have IdP data in BloodHound):"
+        Write-Host "  NOTE: SAML file contains edges referencing external IdP nodes (OktaUser, AZUser, etc.)"
+        Write-Host "  Only upload this file if you have corresponding Okta/Azure/PingOne data in BloodHound."
         foreach ($f in $tier4Files) {
             Write-Host "  - $(Split-Path $f.File -Leaf)"
         }
         Write-Host ""
     }
 
-    Write-Host "Combined output (alternative to tier-by-tier upload):"
+    Write-Host "Combined output (alternative to tier-by-tier upload, excludes SAML):"
     Write-Host "  - $(Split-Path $combinedFile -Leaf)"
     Write-Host ""
     Write-Host "============================================="
