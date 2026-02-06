@@ -457,7 +457,6 @@ function ConvertTo-PascalCase {
 function Write-GitHoundPayload {
     Param(
         [Parameter(Mandatory = $true)][string]$OutputPath,
-        [Parameter(Mandatory = $true)][string]$Timestamp,
         [Parameter(Mandatory = $true)][string]$OrgName,
         [Parameter(Mandatory = $true)][string]$PhaseName,
         [Parameter(Mandatory = $true)][int]$Tier,
@@ -468,7 +467,7 @@ function Write-GitHoundPayload {
     $safeNodes = if ($null -eq $Nodes) { @() } else { @($Nodes) }
     $safeEdges = if ($null -eq $Edges) { @() } else { @($Edges) }
 
-    $filename = "${Timestamp}_${OrgName}_${PhaseName}.json"
+    $filename = "githound_${PhaseName}_${OrgName}.json"
     $filepath = Join-Path -Path $OutputPath -ChildPath $filename
 
     $payload = [PSCustomObject]@{
@@ -1101,15 +1100,24 @@ function Get-GraphQLBatchedRepoDetails {
                         organization_id = $OrgId
                         repository_name = $repoFullName
                         repository_id = $repoId
+                        protection_enforce_admins = $false
+                        protection_lock_branch = $false
+                        protection_required_pull_request_reviews = $false
+                        protection_required_approving_review_count = 0
+                        protection_require_code_owner_reviews = $false
+                        protection_require_last_push_approval = $false
+                        protection_push_restrictions = $false
+                        query_branch_write = "MATCH p=(:GHUser)-[:GHCanWriteBranch|GHCanEditAndWriteBranch]->(:GHBranch {objectid:'$($branchId)'}) RETURN p"
                     }
 
                     if ($protection) {
-                        $props | Add-Member -NotePropertyName 'protection_enforce_admins' -NotePropertyValue $protection.isAdminEnforced
-                        $props | Add-Member -NotePropertyName 'protection_lock_branch' -NotePropertyValue $protection.lockBranch
-                        $props | Add-Member -NotePropertyName 'protection_required_pull_request_reviews' -NotePropertyValue $protection.requiresApprovingReviews
-                        $props | Add-Member -NotePropertyName 'protection_required_approving_review_count' -NotePropertyValue $protection.requiredApprovingReviewCount
-                        $props | Add-Member -NotePropertyName 'protection_require_code_owner_reviews' -NotePropertyValue $protection.requiresCodeOwnerReviews
-                        $props | Add-Member -NotePropertyName 'protection_require_last_push_approval' -NotePropertyValue $protection.requireLastPushApproval
+                        $props.protection_enforce_admins = $protection.isAdminEnforced
+                        $props.protection_lock_branch = $protection.lockBranch
+                        $props.protection_required_pull_request_reviews = $protection.requiresApprovingReviews
+                        $props.protection_required_approving_review_count = $protection.requiredApprovingReviewCount
+                        $props.protection_require_code_owner_reviews = $protection.requiresCodeOwnerReviews
+                        $props.protection_require_last_push_approval = $protection.requireLastPushApproval
+                        $props.protection_push_restrictions = ($protection.pushAllowances.nodes.Count -gt 0)
 
                         # Bypass PR allowances
                         foreach ($allowance in $protection.bypassPullRequestAllowances.nodes) {
@@ -1143,6 +1151,7 @@ function Get-GraphQLBatchedRepoDetails {
                         repository_name = $repoFullName
                         repository_id = $repoId
                         short_name = Normalize-Null $env.name
+                        can_admins_bypass = ""
                     }
 
                     $null = $nodes.Add((New-GitHoundNode -Id $env.id -Kind 'GHEnvironment' -Properties $envProps))
@@ -1272,10 +1281,10 @@ function Invoke-PacedRestPhase {
         # If chunk size is 0, we need to wait for rate limit reset
         if ($chunkSize -le 0) {
             $waitSec = $chunkInfo.SecondsToReset + 2
-            Write-Host "[Paced] $PhaseName: Rate limit exhausted ($($chunkInfo.Remaining) remaining). Waiting $waitSec seconds until $($chunkInfo.ResetAt.ToString('HH:mm:ss'))..." -ForegroundColor Yellow
+            Write-Host "[Paced] ${PhaseName}: Rate limit exhausted ($($chunkInfo.Remaining) remaining). Waiting $waitSec seconds until $($chunkInfo.ResetAt.ToString('HH:mm:ss'))..." -ForegroundColor Yellow
             Start-Sleep -Seconds $waitSec
             $null = Update-GitHubSessionToken -Session $Session -Force
-            Write-Host "[Paced] $PhaseName: Rate limit reset. Token refreshed." -ForegroundColor Green
+            Write-Host "[Paced] ${PhaseName}: Rate limit reset. Token refreshed." -ForegroundColor Green
             continue
         }
 
@@ -1302,7 +1311,7 @@ function Invoke-PacedRestPhase {
         }
 
         $processedSoFar += $chunkRepos.Count
-        Write-Host "[Paced] $PhaseName: $processedSoFar/$totalRepos repos complete" -ForegroundColor Cyan
+        Write-Host "[Paced] ${PhaseName}: $processedSoFar/$totalRepos repos complete" -ForegroundColor Cyan
 
         # Refresh token between chunks if more work remains
         if ($processedSoFar -lt $totalRepos) {
@@ -1540,6 +1549,21 @@ function Get-RestEnvironmentsWithSecrets {
             $envResult = Invoke-RestWithRetry -Uri $envUri -Headers $Session.Headers
 
             foreach ($environment in $envResult.environments) {
+                # Create environment node with can_admins_bypass from REST data
+                $repoName = ($repo.properties.full_name -split '/')[-1]
+                $envNodeProps = [pscustomobject]@{
+                    name = "$repoName\$($environment.name)"
+                    id = Normalize-Null $environment.id
+                    node_id = Normalize-Null $environment.node_id
+                    organization = Normalize-Null $OrgLogin
+                    organization_id = Normalize-Null $OrgId
+                    repository_name = Normalize-Null $repo.properties.full_name
+                    repository_id = Normalize-Null $repo.id
+                    short_name = Normalize-Null $environment.name
+                    can_admins_bypass = Normalize-Null $environment.can_admins_bypass
+                }
+                $null = $nodes.Add((New-GitHoundNode -Id $environment.node_id -Kind 'GHEnvironment' -Properties $envNodeProps))
+
                 # Fetch deployment branch policies if custom policies enabled
                 if ($environment.deployment_branch_policy.custom_branch_policies -eq $true) {
                     try {
@@ -1715,7 +1739,7 @@ function Get-RestSecrets {
             $result = Invoke-RestWithRetry -Uri $secretUri -Headers $Session.Headers
 
             foreach ($secret in $result.secrets) {
-                $secretId = "GHRepoSecret_$($repo.id)_$($secret.name)"
+                $secretId = "GHSecret_$($repo.id)_$($secret.name)"
                 $props = [pscustomobject]@{
                     id = Normalize-Null $secretId
                     name = Normalize-Null $secret.name
@@ -1725,6 +1749,7 @@ function Get-RestSecrets {
                     repository_id = Normalize-Null $repo.id
                     created_at = Normalize-Null $secret.created_at
                     updated_at = Normalize-Null $secret.updated_at
+                    visibility = Normalize-Null $secret.visibility
                 }
 
                 $null = $repoNodes.Add((New-GitHoundNode -Id $secretId -Kind 'GHRepoSecret' -Properties $props))
@@ -2780,15 +2805,24 @@ function Get-GraphQLBranches {
                     organization_id = $OrgId
                     repository_name = $repoFullName
                     repository_id = $repoId
+                    protection_enforce_admins = $false
+                    protection_lock_branch = $false
+                    protection_required_pull_request_reviews = $false
+                    protection_required_approving_review_count = 0
+                    protection_require_code_owner_reviews = $false
+                    protection_require_last_push_approval = $false
+                    protection_push_restrictions = $false
+                    query_branch_write = "MATCH p=(:GHUser)-[:GHCanWriteBranch|GHCanEditAndWriteBranch]->(:GHBranch {objectid:'$($branchId)'}) RETURN p"
                 }
 
                 if ($protection) {
-                    $props | Add-Member -NotePropertyName 'protection_enforce_admins' -NotePropertyValue $protection.isAdminEnforced
-                    $props | Add-Member -NotePropertyName 'protection_lock_branch' -NotePropertyValue $protection.lockBranch
-                    $props | Add-Member -NotePropertyName 'protection_required_pull_request_reviews' -NotePropertyValue $protection.requiresApprovingReviews
-                    $props | Add-Member -NotePropertyName 'protection_required_approving_review_count' -NotePropertyValue $protection.requiredApprovingReviewCount
-                    $props | Add-Member -NotePropertyName 'protection_require_code_owner_reviews' -NotePropertyValue $protection.requiresCodeOwnerReviews
-                    $props | Add-Member -NotePropertyName 'protection_require_last_push_approval' -NotePropertyValue $protection.requireLastPushApproval
+                    $props.protection_enforce_admins = $protection.isAdminEnforced
+                    $props.protection_lock_branch = $protection.lockBranch
+                    $props.protection_required_pull_request_reviews = $protection.requiresApprovingReviews
+                    $props.protection_required_approving_review_count = $protection.requiredApprovingReviewCount
+                    $props.protection_require_code_owner_reviews = $protection.requiresCodeOwnerReviews
+                    $props.protection_require_last_push_approval = $protection.requireLastPushApproval
+                    $props.protection_push_restrictions = ($protection.pushAllowances.nodes.Count -gt 0)
 
                     # Bypass PR allowances
                     foreach ($allowance in $protection.bypassPullRequestAllowances.nodes) {
@@ -3201,7 +3235,9 @@ function Invoke-GitHoundGraphQL {
         [ValidateSet('All', 'Users', 'Teams', 'Repos', 'Branches', 'Environments',
                      'Workflows', 'Secrets', 'TeamRoles', 'OrgRoles', 'RepoRoles',
                      'Collaborators', 'SecretScanning', 'AppInstallations', 'SAML')]
-        [string[]]$Collect = @('All'),
+        [string[]]$Collect = @('Users', 'Teams', 'Repos', 'Branches',
+                               'Workflows', 'TeamRoles', 'OrgRoles', 'RepoRoles',
+                               'Collaborators', 'SecretScanning', 'SAML'),
 
         [Parameter(Mandatory = $false)]
         [int]$UserLimit = 0,
@@ -3340,7 +3376,7 @@ function Invoke-GitHoundGraphQL {
 
     # Write organization phase
     if ($completedPhases -notcontains 'organization') {
-        $orgFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'organization' -Tier 1 -Nodes $org.Nodes -Edges $org.Edges
+        $orgFile = Write-GitHoundPayload -OutputPath $outputFolder -OrgName $orgId -PhaseName 'Organization' -Tier 1 -Nodes $org.Nodes -Edges $org.Edges
         $null = $writtenFiles.Add(@{ File = $orgFile; Tier = 1; Phase = 'organization' })
         $completedPhases += 'organization'
         Save-Checkpoint
@@ -3362,7 +3398,7 @@ function Invoke-GitHoundGraphQL {
             $startCursor = if ($phaseProgress.users) { $phaseProgress.users.cursor } else { $null }
             $users = Get-GraphQLUsers -Session $Session -OrgLogin $orgLogin -OrgId $orgId -UserLimit $UserLimit -StartCursor $startCursor
 
-            $userFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'users' -Tier 1 -Nodes $users.Nodes -Edges $users.Edges
+            $userFile = Write-GitHoundPayload -OutputPath $outputFolder -OrgName $orgId -PhaseName 'User' -Tier 1 -Nodes $users.Nodes -Edges $users.Edges
             $null = $writtenFiles.Add(@{ File = $userFile; Tier = 1; Phase = 'users' })
 
             $null = $allNodes.AddRange(@($users.Nodes))
@@ -3373,7 +3409,7 @@ function Invoke-GitHoundGraphQL {
             Save-Checkpoint
         } else {
             Write-Host "[*] Skipping users phase (already completed)"
-            $userFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_users.json"
+            $userFile = Join-Path -Path $outputFolder -ChildPath "githound_User_${orgId}.json"
             $null = $writtenFiles.Add(@{ File = $userFile; Tier = 1; Phase = 'users' })
             $existingData = Read-GitHoundPhaseData -FilePath $userFile
             if ($existingData) {
@@ -3393,7 +3429,7 @@ function Invoke-GitHoundGraphQL {
 
             $teams = Get-GraphQLTeams -Session $Session -OrgLogin $orgLogin -OrgId $orgId
 
-            $teamFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'teams' -Tier 1 -Nodes $teams.Nodes -Edges $teams.Edges
+            $teamFile = Write-GitHoundPayload -OutputPath $outputFolder -OrgName $orgId -PhaseName 'Team' -Tier 1 -Nodes $teams.Nodes -Edges $teams.Edges
             $null = $writtenFiles.Add(@{ File = $teamFile; Tier = 1; Phase = 'teams' })
 
             $null = $allNodes.AddRange(@($teams.Nodes))
@@ -3404,7 +3440,7 @@ function Invoke-GitHoundGraphQL {
             Save-Checkpoint
         } else {
             Write-Host "[*] Skipping teams phase (already completed)"
-            $teamFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_teams.json"
+            $teamFile = Join-Path -Path $outputFolder -ChildPath "githound_Team_${orgId}.json"
             $null = $writtenFiles.Add(@{ File = $teamFile; Tier = 1; Phase = 'teams' })
             $existingData = Read-GitHoundPhaseData -FilePath $teamFile
             if ($existingData) {
@@ -3424,7 +3460,7 @@ function Invoke-GitHoundGraphQL {
 
             $repos = Get-GraphQLRepositories -Session $Session -OrgLogin $orgLogin -OrgId $orgId -RepoFilter $RepoFilter -RepoVisibility $RepoVisibility
 
-            $repoFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'repos' -Tier 1 -Nodes $repos.Nodes -Edges $repos.Edges
+            $repoFile = Write-GitHoundPayload -OutputPath $outputFolder -OrgName $orgId -PhaseName 'Repository' -Tier 1 -Nodes $repos.Nodes -Edges $repos.Edges
             $null = $writtenFiles.Add(@{ File = $repoFile; Tier = 1; Phase = 'repos' })
 
             $null = $allNodes.AddRange(@($repos.Nodes))
@@ -3436,7 +3472,7 @@ function Invoke-GitHoundGraphQL {
             Save-Checkpoint
         } else {
             Write-Host "[*] Skipping repos phase (already completed)"
-            $repoFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_repos.json"
+            $repoFile = Join-Path -Path $outputFolder -ChildPath "githound_Repository_${orgId}.json"
             $null = $writtenFiles.Add(@{ File = $repoFile; Tier = 1; Phase = 'repos' })
             $existingData = Read-GitHoundPhaseData -FilePath $repoFile
             if ($existingData) {
@@ -3458,7 +3494,7 @@ function Invoke-GitHoundGraphQL {
             # Use batched approach for efficiency (87% API reduction)
             $branches = Get-GraphQLBatchedRepoDetails -Session $Session -OrgLogin $orgLogin -OrgId $orgId -Repositories $collectedRepos -BatchSize $BatchSize
 
-            $branchFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'branches' -Tier 2 -Nodes $branches.Nodes -Edges $branches.Edges
+            $branchFile = Write-GitHoundPayload -OutputPath $outputFolder -OrgName $orgId -PhaseName 'Branch' -Tier 2 -Nodes $branches.Nodes -Edges $branches.Edges
             $null = $writtenFiles.Add(@{ File = $branchFile; Tier = 2; Phase = 'branches' })
 
             $null = $allNodes.AddRange(@($branches.Nodes))
@@ -3469,7 +3505,7 @@ function Invoke-GitHoundGraphQL {
             Save-Checkpoint
         } else {
             Write-Host "[*] Skipping branches phase (already completed)"
-            $branchFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_branches.json"
+            $branchFile = Join-Path -Path $outputFolder -ChildPath "githound_Branch_${orgId}.json"
             $null = $writtenFiles.Add(@{ File = $branchFile; Tier = 2; Phase = 'branches' })
             $existingData = Read-GitHoundPhaseData -FilePath $branchFile
             if ($existingData) {
@@ -3500,7 +3536,7 @@ function Invoke-GitHoundGraphQL {
                 $envSecrets = Get-RestEnvironmentsWithSecrets -Session $Session -OrgLogin $orgLogin -OrgId $orgId -Repositories $collectedRepos -ThrottleLimit $ThrottleLimit
             }
 
-            $envFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'environments' -Tier 2 -Nodes $envSecrets.Nodes -Edges $envSecrets.Edges
+            $envFile = Write-GitHoundPayload -OutputPath $outputFolder -OrgName $orgId -PhaseName 'Environment' -Tier 2 -Nodes $envSecrets.Nodes -Edges $envSecrets.Edges
             $null = $writtenFiles.Add(@{ File = $envFile; Tier = 2; Phase = 'environments' })
 
             $null = $allNodes.AddRange(@($envSecrets.Nodes))
@@ -3511,7 +3547,7 @@ function Invoke-GitHoundGraphQL {
             Save-Checkpoint
         } else {
             Write-Host "[*] Skipping environments phase (already completed)"
-            $envFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_environments.json"
+            $envFile = Join-Path -Path $outputFolder -ChildPath "githound_Environment_${orgId}.json"
             $null = $writtenFiles.Add(@{ File = $envFile; Tier = 2; Phase = 'environments' })
             $existingData = Read-GitHoundPhaseData -FilePath $envFile
             if ($existingData) {
@@ -3542,7 +3578,7 @@ function Invoke-GitHoundGraphQL {
                 $workflows = Get-RestWorkflows -Session $Session -Repositories $collectedRepos -ThrottleLimit $ThrottleLimit
             }
 
-            $wfFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'workflows' -Tier 2 -Nodes $workflows.Nodes -Edges $workflows.Edges
+            $wfFile = Write-GitHoundPayload -OutputPath $outputFolder -OrgName $orgId -PhaseName 'Workflow' -Tier 2 -Nodes $workflows.Nodes -Edges $workflows.Edges
             $null = $writtenFiles.Add(@{ File = $wfFile; Tier = 2; Phase = 'workflows' })
 
             $null = $allNodes.AddRange(@($workflows.Nodes))
@@ -3553,7 +3589,7 @@ function Invoke-GitHoundGraphQL {
             Save-Checkpoint
         } else {
             Write-Host "[*] Skipping workflows phase (already completed)"
-            $wfFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_workflows.json"
+            $wfFile = Join-Path -Path $outputFolder -ChildPath "githound_Workflow_${orgId}.json"
             $null = $writtenFiles.Add(@{ File = $wfFile; Tier = 2; Phase = 'workflows' })
             $existingData = Read-GitHoundPhaseData -FilePath $wfFile
             if ($existingData) {
@@ -3584,7 +3620,7 @@ function Invoke-GitHoundGraphQL {
                 $secrets = Get-RestSecrets -Session $Session -OrgLogin $orgLogin -OrgId $orgId -Repositories $collectedRepos -ThrottleLimit $ThrottleLimit
             }
 
-            $secretFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'secrets' -Tier 2 -Nodes $secrets.Nodes -Edges $secrets.Edges
+            $secretFile = Write-GitHoundPayload -OutputPath $outputFolder -OrgName $orgId -PhaseName 'Secret' -Tier 2 -Nodes $secrets.Nodes -Edges $secrets.Edges
             $null = $writtenFiles.Add(@{ File = $secretFile; Tier = 2; Phase = 'secrets' })
 
             $null = $allNodes.AddRange(@($secrets.Nodes))
@@ -3595,7 +3631,7 @@ function Invoke-GitHoundGraphQL {
             Save-Checkpoint
         } else {
             Write-Host "[*] Skipping secrets phase (already completed)"
-            $secretFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_secrets.json"
+            $secretFile = Join-Path -Path $outputFolder -ChildPath "githound_Secret_${orgId}.json"
             $null = $writtenFiles.Add(@{ File = $secretFile; Tier = 2; Phase = 'secrets' })
             $existingData = Read-GitHoundPhaseData -FilePath $secretFile
             if ($existingData) {
@@ -3615,7 +3651,7 @@ function Invoke-GitHoundGraphQL {
 
             $orgRoles = Get-GraphQLOrgRoles -Session $Session -OrgLogin $orgLogin -OrgId $orgId -Users $collectedUsers
 
-            $orFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'orgroles' -Tier 3 -Nodes $orgRoles.Nodes -Edges $orgRoles.Edges
+            $orFile = Write-GitHoundPayload -OutputPath $outputFolder -OrgName $orgId -PhaseName 'OrgRole' -Tier 3 -Nodes $orgRoles.Nodes -Edges $orgRoles.Edges
             $null = $writtenFiles.Add(@{ File = $orFile; Tier = 3; Phase = 'orgroles' })
 
             $null = $allNodes.AddRange(@($orgRoles.Nodes))
@@ -3626,7 +3662,7 @@ function Invoke-GitHoundGraphQL {
             Save-Checkpoint
         } else {
             Write-Host "[*] Skipping orgroles phase (already completed)"
-            $orFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_orgroles.json"
+            $orFile = Join-Path -Path $outputFolder -ChildPath "githound_OrgRole_${orgId}.json"
             $null = $writtenFiles.Add(@{ File = $orFile; Tier = 3; Phase = 'orgroles' })
             $existingData = Read-GitHoundPhaseData -FilePath $orFile
             if ($existingData) {
@@ -3646,7 +3682,7 @@ function Invoke-GitHoundGraphQL {
 
             $repoRoles = Get-GraphQLRepoRoles -Session $Session -OrgLogin $orgLogin -OrgId $orgId -Repositories $collectedRepos
 
-            $rrFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'reporoles' -Tier 3 -Nodes $repoRoles.Nodes -Edges $repoRoles.Edges
+            $rrFile = Write-GitHoundPayload -OutputPath $outputFolder -OrgName $orgId -PhaseName 'RepoRole' -Tier 3 -Nodes $repoRoles.Nodes -Edges $repoRoles.Edges
             $null = $writtenFiles.Add(@{ File = $rrFile; Tier = 3; Phase = 'reporoles' })
 
             $null = $allNodes.AddRange(@($repoRoles.Nodes))
@@ -3657,7 +3693,7 @@ function Invoke-GitHoundGraphQL {
             Save-Checkpoint
         } else {
             Write-Host "[*] Skipping reporoles phase (already completed)"
-            $rrFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_reporoles.json"
+            $rrFile = Join-Path -Path $outputFolder -ChildPath "githound_RepoRole_${orgId}.json"
             $null = $writtenFiles.Add(@{ File = $rrFile; Tier = 3; Phase = 'reporoles' })
             $existingData = Read-GitHoundPhaseData -FilePath $rrFile
             if ($existingData) {
@@ -3688,7 +3724,7 @@ function Invoke-GitHoundGraphQL {
                 $teamRoles = Get-RestTeamRepoPermissions -Session $Session -OrgLogin $orgLogin -Repositories $collectedRepos -ThrottleLimit $ThrottleLimit
             }
 
-            $trFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'teamroles' -Tier 3 -Nodes $teamRoles.Nodes -Edges $teamRoles.Edges
+            $trFile = Write-GitHoundPayload -OutputPath $outputFolder -OrgName $orgId -PhaseName 'TeamRoles' -Tier 3 -Nodes $teamRoles.Nodes -Edges $teamRoles.Edges
             $null = $writtenFiles.Add(@{ File = $trFile; Tier = 3; Phase = 'teamroles' })
 
             $null = $allEdges.AddRange(@($teamRoles.Edges))
@@ -3698,7 +3734,7 @@ function Invoke-GitHoundGraphQL {
             Save-Checkpoint
         } else {
             Write-Host "[*] Skipping teamroles phase (already completed)"
-            $trFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_teamroles.json"
+            $trFile = Join-Path -Path $outputFolder -ChildPath "githound_TeamRoles_${orgId}.json"
             $null = $writtenFiles.Add(@{ File = $trFile; Tier = 3; Phase = 'teamroles' })
             $existingData = Read-GitHoundPhaseData -FilePath $trFile
             if ($existingData) {
@@ -3728,7 +3764,7 @@ function Invoke-GitHoundGraphQL {
                 $collaborators = Get-RestCollaborators -Session $Session -Repositories $collectedRepos -ThrottleLimit $ThrottleLimit
             }
 
-            $collabFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'collaborators' -Tier 3 -Nodes $collaborators.Nodes -Edges $collaborators.Edges
+            $collabFile = Write-GitHoundPayload -OutputPath $outputFolder -OrgName $orgId -PhaseName 'Collaborator' -Tier 3 -Nodes $collaborators.Nodes -Edges $collaborators.Edges
             $null = $writtenFiles.Add(@{ File = $collabFile; Tier = 3; Phase = 'collaborators' })
 
             $null = $allEdges.AddRange(@($collaborators.Edges))
@@ -3738,7 +3774,7 @@ function Invoke-GitHoundGraphQL {
             Save-Checkpoint
         } else {
             Write-Host "[*] Skipping collaborators phase (already completed)"
-            $collabFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_collaborators.json"
+            $collabFile = Join-Path -Path $outputFolder -ChildPath "githound_Collaborator_${orgId}.json"
             $null = $writtenFiles.Add(@{ File = $collabFile; Tier = 3; Phase = 'collaborators' })
             $existingData = Read-GitHoundPhaseData -FilePath $collabFile
             if ($existingData) {
@@ -3758,7 +3794,7 @@ function Invoke-GitHoundGraphQL {
 
             $secretAlerts = Get-RestSecretScanningAlerts -Session $Session -OrgLogin $orgLogin -OrgId $orgId
 
-            $ssFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'secretscanning' -Tier 4 -Nodes $secretAlerts.Nodes -Edges $secretAlerts.Edges
+            $ssFile = Write-GitHoundPayload -OutputPath $outputFolder -OrgName $orgId -PhaseName 'SecretAlerts' -Tier 4 -Nodes $secretAlerts.Nodes -Edges $secretAlerts.Edges
             $null = $writtenFiles.Add(@{ File = $ssFile; Tier = 4; Phase = 'secretscanning' })
 
             $null = $allNodes.AddRange(@($secretAlerts.Nodes))
@@ -3769,7 +3805,7 @@ function Invoke-GitHoundGraphQL {
             Save-Checkpoint
         } else {
             Write-Host "[*] Skipping secretscanning phase (already completed)"
-            $ssFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_secretscanning.json"
+            $ssFile = Join-Path -Path $outputFolder -ChildPath "githound_SecretAlerts_${orgId}.json"
             $null = $writtenFiles.Add(@{ File = $ssFile; Tier = 4; Phase = 'secretscanning' })
             $existingData = Read-GitHoundPhaseData -FilePath $ssFile
             if ($existingData) {
@@ -3790,7 +3826,7 @@ function Invoke-GitHoundGraphQL {
 
             $appInstalls = Get-RestAppInstallations -Session $Session -OrgLogin $orgLogin -OrgId $orgId
 
-            $appFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'appinstallations' -Tier 4 -Nodes $appInstalls.Nodes -Edges $appInstalls.Edges
+            $appFile = Write-GitHoundPayload -OutputPath $outputFolder -OrgName $orgId -PhaseName 'AppInstallation' -Tier 4 -Nodes $appInstalls.Nodes -Edges $appInstalls.Edges
             $null = $writtenFiles.Add(@{ File = $appFile; Tier = 4; Phase = 'appinstallations' })
 
             $null = $allNodes.AddRange(@($appInstalls.Nodes))
@@ -3801,7 +3837,7 @@ function Invoke-GitHoundGraphQL {
             Save-Checkpoint
         } else {
             Write-Host "[*] Skipping appinstallations phase (already completed)"
-            $appFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_appinstallations.json"
+            $appFile = Join-Path -Path $outputFolder -ChildPath "githound_AppInstallation_${orgId}.json"
             $null = $writtenFiles.Add(@{ File = $appFile; Tier = 4; Phase = 'appinstallations' })
             $existingData = Read-GitHoundPhaseData -FilePath $appFile
             if ($existingData) {
@@ -3821,7 +3857,7 @@ function Invoke-GitHoundGraphQL {
 
             $saml = Get-GraphQLSAML -Session $Session -OrgLogin $orgLogin -OrgId $orgId
 
-            $samlFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'saml' -Tier 4 -Nodes $saml.Nodes -Edges $saml.Edges
+            $samlFile = Write-GitHoundPayload -OutputPath $outputFolder -OrgName $orgId -PhaseName 'saml' -Tier 4 -Nodes $saml.Nodes -Edges $saml.Edges
             $null = $writtenFiles.Add(@{ File = $samlFile; Tier = 4; Phase = 'saml' })
 
             # NOTE: SAML data is NOT added to combined output (kept in separate file)
@@ -3831,7 +3867,7 @@ function Invoke-GitHoundGraphQL {
             Save-Checkpoint
         } else {
             Write-Host "[*] Skipping saml phase (already completed)"
-            $samlFile = Join-Path -Path $outputFolder -ChildPath "${timestamp}_${orgId}_saml.json"
+            $samlFile = Join-Path -Path $outputFolder -ChildPath "githound_saml_${orgId}.json"
             $null = $writtenFiles.Add(@{ File = $samlFile; Tier = 4; Phase = 'saml' })
         }
     }
@@ -3841,7 +3877,7 @@ function Invoke-GitHoundGraphQL {
     # ===========================================
     try {
         Write-Host "[*] Writing combined output"
-        $combinedFile = Write-GitHoundPayload -OutputPath $outputFolder -Timestamp $timestamp -OrgName $orgId -PhaseName 'combined' -Tier 0 -Nodes $allNodes -Edges $allEdges
+        $combinedFile = Write-GitHoundPayload -OutputPath $outputFolder -OrgName $orgId -PhaseName 'combined' -Tier 0 -Nodes $allNodes -Edges $allEdges
     } catch {
         Write-Warning "[!] Failed to write combined output: $_"
     }
