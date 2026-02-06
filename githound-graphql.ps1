@@ -353,11 +353,14 @@ function Invoke-GitHubGraphQL {
                 }
             }
 
-            # Handle rate limiting (429 or 403)
+            # Handle rate limiting (429 or 403 or GraphQL body error)
             if ($_.Exception.Message -match "rate limit" -or $statusCode -eq 429 -or $statusCode -eq 403) {
+                $requestSuccessful = $false
                 $retryCount++
                 Write-Warning "GraphQL rate limit hit. Checking rate limit status... (Retry $retryCount/5)"
                 Wait-GitHubGraphQLRateLimit -Session $Session
+                # Fallback wait if rate limit check didn't sleep (secondary/abuse rate limit)
+                Start-Sleep -Seconds ([Math]::Min(60 * $retryCount, 300))
             }
             else {
                 throw $_
