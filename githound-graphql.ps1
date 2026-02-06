@@ -826,6 +826,94 @@ function Invoke-GitHubRest {
     }
 }
 
+function Invoke-GitHubRestPaginated {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory=$true)]
+        [PSTypeName('GitHound.Session')]$Session,
+
+        [Parameter(Mandatory=$true)]
+        [string]$Path,
+
+        [Parameter(Mandatory=$false)]
+        [string]$Method = 'GET'
+    )
+
+    $null = Update-GitHubSessionToken -Session $Session
+
+    $linkHeader = $null
+    $allResults = New-Object System.Collections.ArrayList
+
+    do {
+        $requestSuccessful = $false
+        $retryCount = 0
+
+        while (-not $requestSuccessful -and $retryCount -lt 5) {
+            try {
+                if ($linkHeader) {
+                    $response = Invoke-WebRequest -Uri $linkHeader -Headers $Session.Headers -Method $Method -ErrorAction Stop
+                } else {
+                    $separator = if ($Path.Contains('?')) { '&' } else { '?' }
+                    $uri = "$($Session.Uri)$Path${separator}per_page=100"
+                    $response = Invoke-WebRequest -Uri $uri -Headers $Session.Headers -Method $Method -ErrorAction Stop
+                }
+                $requestSuccessful = $true
+                Add-GitHoundRestApiCall
+            }
+            catch {
+                $statusCode = $_.Exception.Response.StatusCode
+                if ($statusCode -eq 401) {
+                    Write-Warning "Token expired. Refreshing..."
+                    try {
+                        $null = Update-GitHubSessionToken -Session $Session -Force
+                        $retryCount++
+                        continue
+                    } catch {
+                        throw "Authentication failed and token refresh failed: $_"
+                    }
+                }
+                if ($statusCode -eq 429 -or $statusCode -eq 403) {
+                    $retryCount++
+                    Write-Warning "Rate limit hit. Checking rate limit status... (Retry $retryCount/5)"
+                    Wait-GitHubRestRateLimit -Session $Session
+                }
+                elseif ($statusCode -eq 404) {
+                    return @()
+                }
+                else {
+                    throw $_
+                }
+            }
+        }
+
+        if (-not $requestSuccessful) {
+            throw "Failed after 5 retry attempts due to rate limiting"
+        }
+
+        # Parse response and collect results
+        $parsed = $response.Content | ConvertFrom-Json
+        if ($parsed -is [System.Array]) {
+            $null = $allResults.AddRange($parsed)
+        } else {
+            $null = $allResults.Add($parsed)
+        }
+
+        # Follow Link header pagination
+        $linkHeader = $null
+        if ($response.Headers['Link']) {
+            $links = $response.Headers['Link'].Split(',')
+            foreach ($link in $links) {
+                if ($link.EndsWith('rel="next"')) {
+                    $linkHeader = $link.Split(';')[0].Trim() -replace '[<>]', ''
+                    break
+                }
+            }
+        }
+    } while ($linkHeader)
+
+    return $allResults.ToArray()
+}
+
 function Add-GitHoundRestApiCall {
     if (-not $script:GitHoundMetrics.Enabled) { return }
     $script:GitHoundMetrics.TotalApiCalls++
@@ -1101,8 +1189,6 @@ function Get-GraphQLBatchedRepoDetails {
                         protected = ($null -ne $protection)
                         organization = $OrgLogin
                         organization_id = $OrgId
-                        repository_name = $repoFullName
-                        repository_id = $repoId
                         protection_enforce_admins = $false
                         protection_lock_branch = $false
                         protection_required_pull_request_reviews = $false
@@ -1561,7 +1647,7 @@ function Get-RestEnvironmentsWithSecrets {
                     organization = Normalize-Null $OrgLogin
                     organization_id = Normalize-Null $OrgId
                     repository_name = Normalize-Null $repo.properties.full_name
-                    repository_id = Normalize-Null $repo.id
+                    repository_id = Normalize-Null $repo.properties.id
                     short_name = Normalize-Null $environment.name
                     can_admins_bypass = Normalize-Null $environment.can_admins_bypass
                 }
@@ -1748,8 +1834,8 @@ function Get-RestSecrets {
                     name = Normalize-Null $secret.name
                     organization_name = Normalize-Null $OrgLogin
                     organization_id = Normalize-Null $OrgId
-                    repository_name = Normalize-Null $repo.properties.full_name
-                    repository_id = Normalize-Null $repo.id
+                    repository_name = Normalize-Null $repo.properties.name
+                    repository_id = Normalize-Null $repo.properties.node_id
                     created_at = Normalize-Null $secret.created_at
                     updated_at = Normalize-Null $secret.updated_at
                     visibility = Normalize-Null $secret.visibility
@@ -2015,20 +2101,20 @@ function Get-RestSecretScanningAlerts {
         $alerts = Invoke-GitHubRest -Session $Session -Path "orgs/$OrgLogin/secret-scanning/alerts?state=open&per_page=100"
 
         foreach ($alert in $alerts) {
-            $alertId = "GHSecretScanningAlert_${OrgId}_$($alert.number)"
+            $alertId = [Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("SSA_${OrgId}_$($alert.repository.node_id)_$($alert.number)"))
             $props = [pscustomobject]@{
                 id = Normalize-Null $alertId
-                name = Normalize-Null "Alert #$($alert.number)"
-                number = Normalize-Null $alert.number
-                organization_name = Normalize-Null $OrgLogin
-                organization_id = Normalize-Null $OrgId
-                repository_name = Normalize-Null $alert.repository.full_name
+                name = Normalize-Null $alert.number
+                repository_name = Normalize-Null $alert.repository.name
                 repository_id = Normalize-Null $alert.repository.node_id
+                repository_url = Normalize-Null $alert.repository.html_url
                 secret_type = Normalize-Null $alert.secret_type
                 secret_type_display_name = Normalize-Null $alert.secret_type_display_name
+                validity = Normalize-Null $alert.validity
                 state = Normalize-Null $alert.state
                 created_at = Normalize-Null $alert.created_at
-                html_url = Normalize-Null $alert.html_url
+                updated_at = Normalize-Null $alert.updated_at
+                url = Normalize-Null $alert.html_url
             }
 
             $null = $nodes.Add((New-GitHoundNode -Id $alertId -Kind 'GHSecretScanningAlert' -Properties $props))
@@ -2072,30 +2158,22 @@ function Get-RestAppInstallations {
         $result = Invoke-GitHubRest -Session $Session -Path "orgs/$OrgLogin/installations?per_page=100"
 
         foreach ($installation in $result.installations) {
-            $installId = "GHAppInstallation_${OrgId}_$($installation.id)"
             $props = [pscustomobject]@{
-                id = Normalize-Null $installId
-                installation_id = Normalize-Null $installation.id
+                id = Normalize-Null $installation.client_id
                 name = Normalize-Null $installation.app_slug
-                app_id = Normalize-Null $installation.app_id
-                app_slug = Normalize-Null $installation.app_slug
-                organization_name = Normalize-Null $OrgLogin
-                organization_id = Normalize-Null $OrgId
-                target_type = Normalize-Null $installation.target_type
+                organization_name = Normalize-Null $installation.account.login
+                organization_id = Normalize-Null $installation.account.node_id
+                repositories_url = Normalize-Null $installation.repositories_url
                 repository_selection = Normalize-Null $installation.repository_selection
+                access_tokens_url = Normalize-Null $installation.access_tokens_url
+                description = Normalize-Null $installation.description
+                html_url = Normalize-Null $installation.html_url
                 created_at = Normalize-Null $installation.created_at
                 updated_at = Normalize-Null $installation.updated_at
+                permissions = Normalize-Null ($installation.permissions | ConvertTo-Json -Depth 10)
             }
 
-            $null = $nodes.Add((New-GitHoundNode -Id $installId -Kind 'GHAppInstallation' -Properties $props))
-            $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasAppInstallation' -StartId $OrgId -EndId $installId -Properties @{ traversable = $false }))
-
-            # Add permissions as properties
-            if ($installation.permissions) {
-                foreach ($perm in $installation.permissions.PSObject.Properties) {
-                    $props | Add-Member -NotePropertyName "permission_$($perm.Name)" -NotePropertyValue $perm.Value -Force
-                }
-            }
+            $null = $nodes.Add((New-GitHoundNode -Id $installation.client_id -Kind 'GHAppInstallation' -Properties $props))
         }
     }
     catch {
@@ -2116,32 +2194,6 @@ function Get-RestAppInstallations {
 
 $script:GraphQLQueries = @{
 
-    Organization = @'
-query Organization($login: String!) {
-    organization(login: $login) {
-        id
-        databaseId
-        login
-        name
-        description
-        url
-        websiteUrl
-        createdAt
-        updatedAt
-        isVerified
-        membersWithRole {
-            totalCount
-        }
-        repositories {
-            totalCount
-        }
-        teams {
-            totalCount
-        }
-    }
-}
-'@
-
     OrganizationMembers = @'
 query OrganizationMembers($login: String!, $first: Int!, $after: String) {
     organization(login: $login) {
@@ -2157,12 +2209,6 @@ query OrganizationMembers($login: String!, $first: Int!, $after: String) {
                     id
                     databaseId
                     login
-                    name
-                    email
-                    company
-                    bio
-                    createdAt
-                    updatedAt
                     isSiteAdmin
                 }
             }
@@ -2187,8 +2233,6 @@ query OrganizationTeams($login: String!, $first: Int!, $after: String) {
                 slug
                 description
                 privacy
-                createdAt
-                updatedAt
                 parentTeam {
                     id
                 }
@@ -2200,46 +2244,6 @@ query OrganizationTeams($login: String!, $first: Int!, $after: String) {
                             login
                         }
                     }
-                }
-            }
-        }
-    }
-}
-'@
-
-    OrganizationRepositories = @'
-query OrganizationRepositories($login: String!, $first: Int!, $after: String) {
-    organization(login: $login) {
-        id
-        repositories(first: $first, after: $after, orderBy: {field: NAME, direction: ASC}) {
-            pageInfo {
-                hasNextPage
-                endCursor
-            }
-            nodes {
-                id
-                databaseId
-                name
-                nameWithOwner
-                description
-                url
-                homepageUrl
-                createdAt
-                updatedAt
-                pushedAt
-                isArchived
-                isDisabled
-                isFork
-                isPrivate
-                visibility
-                forkCount
-                stargazerCount
-                defaultBranchRef {
-                    name
-                }
-                owner {
-                    id
-                    login
                 }
             }
         }
@@ -2448,35 +2452,49 @@ function Get-GraphQLOrganization {
         [PSTypeName('GitHound.Session')]$Session
     )
 
-    $result = Invoke-GitHubGraphQL -Session $Session -Query $script:GraphQLQueries.Organization -Variables @{
-        login = $Session.OrganizationName
+    # Pure REST — no GraphQL needed for organization
+    $restOrg = Invoke-GitHubRest -Session $Session -Path "orgs/$($Session.OrganizationName)"
+    $restActions = $null
+    try {
+        $restActions = Invoke-GitHubRest -Session $Session -Path "orgs/$($Session.OrganizationName)/actions/permissions"
+    } catch {
+        Write-Warning "Could not fetch org actions permissions: $_"
     }
-
-    $org = $result.data.organization
 
     $properties = [pscustomobject]@{
-        id = Normalize-Null $org.databaseId
-        node_id = Normalize-Null $org.id
-        name = Normalize-Null $org.name
-        login = Normalize-Null $org.login
-        description = Normalize-Null $org.description
-        html_url = Normalize-Null $org.url
-        blog = Normalize-Null $org.websiteUrl
-        is_verified = Normalize-Null $org.isVerified
-        created_at = Normalize-Null $org.createdAt
-        updated_at = Normalize-Null $org.updatedAt
-        total_members = Normalize-Null $org.membersWithRole.totalCount
-        total_repos = Normalize-Null $org.repositories.totalCount
-        total_teams = Normalize-Null $org.teams.totalCount
+        id = Normalize-Null $restOrg.id
+        node_id = Normalize-Null $restOrg.node_id
+        name = Normalize-Null $restOrg.name
+        login = Normalize-Null $restOrg.login
+        blog = Normalize-Null $restOrg.blog
+        is_verified = Normalize-Null $restOrg.is_verified
+        public_repos = Normalize-Null $restOrg.public_repos
+        followers = Normalize-Null $restOrg.followers
+        html_url = Normalize-Null $restOrg.html_url
+        created_at = Normalize-Null $restOrg.created_at
+        updated_at = Normalize-Null $restOrg.updated_at
+        total_private_repos = Normalize-Null $restOrg.total_private_repos
+        owned_private_repos = Normalize-Null $restOrg.owned_private_repos
+        collaborators = Normalize-Null $restOrg.collaborators
+        default_repository_permission = Normalize-Null $restOrg.default_repository_permission
+        two_factor_requirement_enabled = Normalize-Null $restOrg.two_factor_requirement_enabled
+        advanced_security_enabled_for_new_repositories = Normalize-Null $restOrg.advanced_security_enabled_for_new_repositories
+        actions_enabled_repositories = Normalize-Null $(if ($restActions) { $restActions.enabled_repositories } else { "" })
+        actions_allowed_actions = Normalize-Null $(if ($restActions) { $restActions.allowed_actions } else { "" })
+        actions_sha_pinning_required = Normalize-Null $(if ($restActions) { $restActions.sha_pinning_required } else { "" })
+        query_users = "MATCH (n:GHUser {organization_id:'$($restOrg.node_id)'}) RETURN n"
+        query_teams = "MATCH (n:GHTeam {organization_id:'$($restOrg.node_id)'}) RETURN n"
+        query_repositories = "MATCH (n:GHRepository {organization_id:'$($restOrg.node_id)'}) RETURN n"
     }
 
-    $node = New-GitHoundNode -Id $org.id -Kind 'GHOrganization' -Properties $properties
+    $node = New-GitHoundNode -Id $restOrg.node_id -Kind 'GHOrganization' -Properties $properties
 
     [PSCustomObject]@{
         Nodes = @($node)
         Edges = @()
-        OrgId = $org.id
-        OrgLogin = $org.login
+        OrgId = $restOrg.node_id
+        OrgLogin = $restOrg.login
+        DefaultRepositoryPermission = $restOrg.default_repository_permission
     }
 }
 
@@ -2500,6 +2518,7 @@ function Get-GraphQLUsers {
 
     $nodes = New-Object System.Collections.ArrayList
     $edges = New-Object System.Collections.ArrayList
+    $userRoleMap = @{}
     $cursor = $StartCursor
     $hasNextPage = $true
     $totalCollected = 0
@@ -2522,20 +2541,22 @@ function Get-GraphQLUsers {
             $user = $memberEdge.node
             $role = $memberEdge.role
 
+            # Store role mapping separately for OrgRoles phase
+            $userRoleMap[$user.id] = $role
+
             $properties = [pscustomobject]@{
                 id = Normalize-Null $user.databaseId
                 node_id = Normalize-Null $user.id
                 name = Normalize-Null $user.login
-                login = Normalize-Null $user.login
-                full_name = Normalize-Null $user.name
-                email = Normalize-Null $user.email
-                company = Normalize-Null $user.company
-                bio = Normalize-Null $user.bio
-                site_admin = Normalize-Null $user.isSiteAdmin
-                created_at = Normalize-Null $user.createdAt
                 organization_name = Normalize-Null $OrgLogin
                 organization_id = Normalize-Null $OrgId
-                org_role = Normalize-Null $role
+                login = Normalize-Null $user.login
+                type = "User"
+                site_admin = Normalize-Null $user.isSiteAdmin
+                query_roles = "MATCH p=(t:GHUser {node_id:'$($user.id)'})-[:GHHasRole|GHMemberOf*1..4]->(:GitHub) RETURN p"
+                query_teams = "MATCH p=(:GHUser {node_id:'$($user.id)'})-[:GHHasRole]->(t:GHTeamRole)-[:GHMemberOf*1..4]->(:GHTeam) RETURN p"
+                query_repositories = "MATCH p=(t:GHUser {node_id:'$($user.id)'})-[:GHHasRole]->(:GHRepoRole)-[:GHReadRepoContents|GHWriteRepoContents|GHWriteRepoPullRequests|GHManageWebhooks|GHManageDeployKeys|GHPushProtectedBranch|GHDeleteAlertsCodeScanning|GHViewSecretScanningAlerts|GHRunOrgMigration|GHBypassBranchProtection|GHEditRepoProtections]->(:GHRepository) RETURN p"
+                query_branches = ""
             }
 
             $null = $nodes.Add((New-GitHoundNode -Id $user.id -Kind 'GHUser' -Properties $properties))
@@ -2551,6 +2572,7 @@ function Get-GraphQLUsers {
     [PSCustomObject]@{
         Nodes = $nodes
         Edges = $edges
+        UserRoleMap = $userRoleMap
     }
 }
 
@@ -2589,13 +2611,14 @@ function Get-GraphQLTeams {
                 id = Normalize-Null $team.databaseId
                 node_id = Normalize-Null $team.id
                 name = Normalize-Null $team.name
+                organization_name = Normalize-Null $OrgLogin
+                organization_id = Normalize-Null $OrgId
                 slug = Normalize-Null $team.slug
                 description = Normalize-Null $team.description
                 privacy = Normalize-Null $team.privacy
-                created_at = Normalize-Null $team.createdAt
-                updated_at = Normalize-Null $team.updatedAt
-                organization_name = Normalize-Null $OrgLogin
-                organization_id = Normalize-Null $OrgId
+                permission = "pull"
+                query_first_degree_members = "MATCH p=(:GHUser)-[:GHHasRole]->(t:GHTeamRole)-[:GHMemberOf]->(:GHTeam {node_id:'$($team.id)'}) RETURN p"
+                query_unrolled_members = "MATCH p=(t:GHTeamRole)-[:GHMemberOf*1..]->(:GHTeam {node_id:'$($team.id)'}) MATCH p1 = (t)<-[:GHHasRole]-(:GHUser) RETURN p,p1"
             }
 
             $null = $nodes.Add((New-GitHoundNode -Id $team.id -Kind 'GHTeam' -Properties $properties))
@@ -2618,6 +2641,8 @@ function Get-GraphQLTeams {
                 team_id = $team.id
                 short_name = 'members'
                 type = 'team'
+                query_members = "MATCH p=(:GHUser)-[GHHasRole]->(:GHTeamRole {id:'$($memberId)'}) RETURN p"
+                query_repositories = "MATCH p=(:GHTeamRole {id:'$($memberId)'})-[*]->(:GHRepository) RETURN p"
             }
             $null = $nodes.Add((New-GitHoundNode -Id $memberId -Kind 'GHTeamRole','GHRole' -Properties $memberProps))
             $null = $edges.Add((New-GitHoundEdge -Kind 'GHMemberOf' -StartId $memberId -EndId $team.id -Properties @{traversable=$true}))
@@ -2631,6 +2656,8 @@ function Get-GraphQLTeams {
                 team_id = $team.id
                 short_name = 'maintainers'
                 type = 'team'
+                query_members = "MATCH p=(:GHUser)-[:GHHasRole]->(:GHTeamRole {id:'$($maintainerId)'}) RETURN p"
+                query_repositories = "MATCH p=(:GHTeamRole {id:'$($maintainerId)'})-[*]->(:GHRepository) RETURN p"
             }
             $null = $nodes.Add((New-GitHoundNode -Id $maintainerId -Kind 'GHTeamRole','GHRole' -Properties $maintainerProps))
             $null = $edges.Add((New-GitHoundEdge -Kind 'GHMemberOf' -StartId $maintainerId -EndId $team.id -Properties @{traversable=$true}))
@@ -2680,60 +2707,82 @@ function Get-GraphQLRepositories {
 
     $nodes = New-Object System.Collections.ArrayList
     $edges = New-Object System.Collections.ArrayList
-    $cursor = $StartCursor
-    $hasNextPage = $true
-    $totalCollected = 0
 
-    while ($hasNextPage) {
-        $result = Invoke-GitHubGraphQL -Session $Session -Query $script:GraphQLQueries.OrganizationRepositories -Variables @{
-            login = $OrgLogin
-            first = 100
-            after = $cursor
+    # Fetch actions permissions (same as before — 1-2 REST calls)
+    $actionsPermissions = $null
+    $enabledRepoIds = $null
+    try {
+        $actionsPermissions = Invoke-GitHubRest -Session $Session -Path "orgs/$OrgLogin/actions/permissions"
+        if ($actionsPermissions.enabled_repositories -ne 'all') {
+            $enabledRepoIds = (Invoke-GitHubRest -Session $Session -Path "orgs/$OrgLogin/actions/permissions/repositories").repositories.node_id
         }
-
-        $reposData = $result.data.organization.repositories
-
-        foreach ($repo in $reposData.nodes) {
-            # Apply filters
-            if ($RepoFilter -ne '' -and $repo.name -notlike $RepoFilter) { continue }
-            if ($RepoVisibility -ne 'all' -and $repo.visibility.ToLower() -ne $RepoVisibility.ToLower()) { continue }
-
-            $properties = [pscustomobject]@{
-                id = Normalize-Null $repo.databaseId
-                node_id = Normalize-Null $repo.id
-                name = Normalize-Null $repo.name
-                full_name = Normalize-Null $repo.nameWithOwner
-                description = Normalize-Null $repo.description
-                html_url = Normalize-Null $repo.url
-                homepage = Normalize-Null $repo.homepageUrl
-                created_at = Normalize-Null $repo.createdAt
-                updated_at = Normalize-Null $repo.updatedAt
-                pushed_at = Normalize-Null $repo.pushedAt
-                archived = Normalize-Null $repo.isArchived
-                disabled = Normalize-Null $repo.isDisabled
-                fork = Normalize-Null $repo.isFork
-                private = Normalize-Null $repo.isPrivate
-                visibility = Normalize-Null $repo.visibility
-                forks = Normalize-Null $repo.forkCount
-                stargazers_count = Normalize-Null $repo.stargazerCount
-                default_branch = Normalize-Null $repo.defaultBranchRef.name
-                organization_name = Normalize-Null $OrgLogin
-                organization_id = Normalize-Null $OrgId
-                owner_id = Normalize-Null $repo.owner.id
-                owner_name = Normalize-Null $repo.owner.login
-            }
-
-            $null = $nodes.Add((New-GitHoundNode -Id $repo.id -Kind 'GHRepository' -Properties $properties))
-            $null = $edges.Add((New-GitHoundEdge -Kind 'GHOwns' -StartId $OrgId -EndId $repo.id -Properties @{ traversable = $true }))
-
-            $totalCollected++
-        }
-
-        $hasNextPage = $reposData.pageInfo.hasNextPage
-        $cursor = $reposData.pageInfo.endCursor
-
-        Write-Host "[*] repos: Fetched $totalCollected repositories..."
+    } catch {
+        Write-Warning "Could not fetch org actions permissions: $_"
     }
+
+    # Paginated REST — returns ALL repos in one go (ceil(N/100) REST calls)
+    $allRepos = Invoke-GitHubRestPaginated -Session $Session -Path "orgs/$OrgLogin/repos"
+
+    foreach ($repo in $allRepos) {
+        # Apply filters
+        if ($RepoFilter -ne '' -and $repo.name -notlike $RepoFilter) { continue }
+        if ($RepoVisibility -ne 'all' -and $repo.visibility -ne $RepoVisibility) { continue }
+
+        # Determine actions_enabled (same logic as before)
+        $actionsEnabled = $false
+        if ($actionsPermissions) {
+            if ($actionsPermissions.enabled_repositories -eq 'all') {
+                $actionsEnabled = $true
+            } else {
+                $actionsEnabled = $enabledRepoIds -contains $repo.node_id
+            }
+        }
+
+        # ALL properties come directly from REST — no per-repo enrichment needed
+        $properties = [pscustomobject]@{
+            id                         = Normalize-Null $repo.id
+            node_id                    = Normalize-Null $repo.node_id
+            name                       = Normalize-Null $repo.name
+            organization_name          = Normalize-Null $OrgLogin
+            organization_id            = Normalize-Null $OrgId
+            owner_id                   = Normalize-Null $repo.owner.id
+            owner_node_id              = Normalize-Null $repo.owner.node_id
+            owner_name                 = Normalize-Null $repo.owner.login
+            full_name                  = Normalize-Null $repo.full_name
+            private                    = Normalize-Null $repo.private
+            html_url                   = Normalize-Null $repo.html_url
+            description                = Normalize-Null $repo.description
+            created_at                 = Normalize-Null $repo.created_at
+            updated_at                 = Normalize-Null $repo.updated_at
+            pushed_at                  = Normalize-Null $repo.pushed_at
+            archived                   = Normalize-Null $repo.archived
+            disabled                   = Normalize-Null $repo.disabled
+            open_issues_count          = Normalize-Null $repo.open_issues_count
+            allow_forking              = Normalize-Null $repo.allow_forking
+            web_commit_signoff_required = Normalize-Null $repo.web_commit_signoff_required
+            visibility                 = Normalize-Null $repo.visibility
+            forks                      = Normalize-Null $repo.forks
+            open_issues                = Normalize-Null $repo.open_issues
+            watchers                   = Normalize-Null $repo.watchers
+            default_branch             = Normalize-Null $repo.default_branch
+            actions_enabled            = Normalize-Null $actionsEnabled
+            secret_scanning            = Normalize-Null $repo.security_and_analysis.secret_scanning.status
+            query_branches             = "MATCH p=(:GHRepository {node_id: '$($repo.node_id)'})-[:GHHasBranch]->(:GHBranch) RETURN p"
+            query_roles                = "MATCH p=(:GHRepoRole)-[]->(:GHRepository {node_id: '$($repo.node_id)'}) RETURN p"
+            query_teams                = "MATCH p=(:GHTeam)-[:GHMemberOf|GHHasRole]->(:GHRepoRole)-[]->(:GHRepository {node_id: '$($repo.node_id)'}) RETURN p"
+            query_workflows            = "MATCH p=(:GHRepository {node_id:'$($repo.node_id)'})-[:GHHasWorkflow]->(w:GHWorkflow) RETURN p"
+            query_user_permissions     = "MATCH p=(:GHUser)-[:GHHasRole]->()-[:GHHasBaseRole|GHHasRole|GHOwns|GHAddMember|GHMemberOf]->(:GHRepoRole)-[]->(:GHRepository {node_id: '$($repo.node_id)'}) RETURN p"
+            query_explicit_readers     = "MATCH p=(role:GitHub)-[:GHHasBaseRole|GHReadRepoContents*1..]->(r:GHRepository {node_id:'$($repo.node_id)'}) MATCH p1=(role)<-[:GHHasRole]-(:GHUser) RETURN p,p1"
+            query_unrolled_readers     = "MATCH p=(:GitHub)-[:GHMemberOf|GHHasRole|GHHasBaseRole|GHReadRepoContents*1..]->(r:GHRepository {node_id:'$($repo.node_id)'}) RETURN p"
+            query_explicit_writers     = "MATCH p=(role:GitHub)-[:GHHasBaseRole|GHWriteRepoContents|GHWriteRepoPullRequests*1..]->(r:GHRepository {node_id:'$($repo.node_id)'}) MATCH p1=(role)<-[:GHHasRole]-(:GHUser) RETURN p,p1"
+            query_unrolled_writers     = "MATCH p=(:GitHub)-[:GHMemberOf|GHHasRole|GHHasBaseRole|GHWriteRepoContents|GHWriteRepoPullRequests*1..]->(r:GHRepository {node_id:'$($repo.node_id)'}) RETURN p"
+        }
+
+        $null = $nodes.Add((New-GitHoundNode -Id $repo.node_id -Kind 'GHRepository' -Properties $properties))
+        $null = $edges.Add((New-GitHoundEdge -Kind 'GHOwns' -StartId $OrgId -EndId $repo.node_id -Properties @{ traversable = $true }))
+    }
+
+    Write-Host "[*] repos: Fetched $($nodes.Count) repositories"
 
     [PSCustomObject]@{
         Nodes = $nodes
@@ -2806,8 +2855,6 @@ function Get-GraphQLBranches {
                     protected = ($null -ne $protection)
                     organization = $OrgLogin
                     organization_id = $OrgId
-                    repository_name = $repoFullName
-                    repository_id = $repoId
                     protection_enforce_admins = $false
                     protection_lock_branch = $false
                     protection_required_pull_request_reviews = $false
@@ -2875,7 +2922,10 @@ function Get-GraphQLOrgRoles {
         [string]$OrgId,
 
         [Parameter(Mandatory=$true)]
-        [array]$Users
+        [hashtable]$UserRoleMap,
+
+        [Parameter(Mandatory=$false)]
+        [string]$DefaultRepositoryPermission = 'none'
     )
 
     $nodes = New-Object System.Collections.ArrayList
@@ -2892,6 +2942,32 @@ function Get-GraphQLOrgRoles {
     $orgAllRepoMaintainId = [Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("${OrgId}_all_repo_maintain"))
     $orgAllRepoAdminId = [Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("${OrgId}_all_repo_admin"))
 
+    # Create 5 base repo role NODES
+    $baseRoles = @(
+        @{ Id = $orgAllRepoReadId; ShortName = 'all_repo_read' },
+        @{ Id = $orgAllRepoTriageId; ShortName = 'all_repo_triage' },
+        @{ Id = $orgAllRepoWriteId; ShortName = 'all_repo_write' },
+        @{ Id = $orgAllRepoMaintainId; ShortName = 'all_repo_maintain' },
+        @{ Id = $orgAllRepoAdminId; ShortName = 'all_repo_admin' }
+    )
+
+    foreach ($baseRole in $baseRoles) {
+        $baseRoleProps = [pscustomobject]@{
+            id = $baseRole.Id
+            name = "$OrgLogin/$($baseRole.ShortName)"
+            organization_name = $OrgLogin
+            organization_id = $OrgId
+            short_name = $baseRole.ShortName
+            type = 'custom'
+            query_explicit_members = "MATCH p=(:GHUser)-[:GHHasRole]->(:GHOrgRole {id:'$($baseRole.Id)'}) RETURN p"
+            query_unrolled_members = "MATCH p=(:GHUser)-[:GHHasRole|GHHasBaseRole|GHMemberOf*1..]->(:GHOrgRole {id:'$($baseRole.Id)'}) RETURN p"
+            query_repositories = "MATCH p=(:GHOrgRole {id:'$($baseRole.Id)'})-[*]->(:GHRepository) RETURN p"
+        }
+        $null = $nodes.Add((New-GitHoundNode -Id $baseRole.Id -Kind 'GHOrgRole', 'GHRole' -Properties $baseRoleProps))
+        # Self-referential GHHasBaseRole edge
+        $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasBaseRole' -StartId $baseRole.Id -EndId $baseRole.Id -Properties @{traversable=$true}))
+    }
+
     # Owners role
     $ownersProps = [pscustomobject]@{
         id = $orgOwnersId
@@ -2900,11 +2976,16 @@ function Get-GraphQLOrgRoles {
         organization_id = $OrgId
         short_name = 'owners'
         type = 'default'
+        query_explicit_members = "MATCH p=(:GHUser)-[:GHHasRole]->(:GHOrgRole {id:'$($orgOwnersId)'}) RETURN p"
+        query_unrolled_members = "MATCH p=(:GHUser)-[:GHHasRole|GHHasBaseRole|GHMemberOf*1..]->(:GHOrgRole {id:'$($orgOwnersId)'}) RETURN p"
+        query_repositories = "MATCH p=(:GHOrgRole {id:'$($orgOwnersId)'})-[*]->(:GHRepository) RETURN p"
     }
     $null = $nodes.Add((New-GitHoundNode -Id $orgOwnersId -Kind 'GHOrgRole', 'GHRole' -Properties $ownersProps))
     $null = $edges.Add((New-GitHoundEdge -Kind 'GHCreateRepository' -StartId $orgOwnersId -EndId $OrgId -Properties @{traversable=$false}))
     $null = $edges.Add((New-GitHoundEdge -Kind 'GHInviteMember' -StartId $orgOwnersId -EndId $OrgId -Properties @{traversable=$false}))
+    $null = $edges.Add((New-GitHoundEdge -Kind 'GHAddCollaborator' -StartId $orgOwnersId -EndId $OrgId -Properties @{traversable=$false}))
     $null = $edges.Add((New-GitHoundEdge -Kind 'GHCreateTeam' -StartId $orgOwnersId -EndId $OrgId -Properties @{traversable=$false}))
+    $null = $edges.Add((New-GitHoundEdge -Kind 'GHTransferRepository' -StartId $orgOwnersId -EndId $OrgId -Properties @{traversable=$false}))
     $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasBaseRole' -StartId $orgOwnersId -EndId $orgAllRepoAdminId -Properties @{traversable=$true}))
 
     # Members role
@@ -2915,16 +2996,93 @@ function Get-GraphQLOrgRoles {
         organization_id = $OrgId
         short_name = 'members'
         type = 'default'
+        query_explicit_members = "MATCH p=(:GHUser)-[:GHHasRole]->(:GHOrgRole {id:'$($orgMembersId)'}) RETURN p"
+        query_unrolled_members = "MATCH p=(:GHUser)-[:GHHasRole|GHHasBaseRole|GHMemberOf*1..]->(:GHOrgRole {id:'$($orgMembersId)'}) RETURN p"
+        query_repositories = "MATCH p=(:GHOrgRole {id:'$($orgMembersId)'})-[*]->(:GHRepository) RETURN p"
     }
     $null = $nodes.Add((New-GitHoundNode -Id $orgMembersId -Kind 'GHOrgRole', 'GHRole' -Properties $membersProps))
     $null = $edges.Add((New-GitHoundEdge -Kind 'GHCreateRepository' -StartId $orgMembersId -EndId $OrgId -Properties @{traversable=$false}))
     $null = $edges.Add((New-GitHoundEdge -Kind 'GHCreateTeam' -StartId $orgMembersId -EndId $OrgId -Properties @{traversable=$false}))
 
-    # Assign users to roles based on their org_role property (from user collection)
-    foreach ($user in $Users) {
-        $userRole = $user.properties.org_role
+    # Members GHHasBaseRole edge based on default_repository_permission
+    if ($DefaultRepositoryPermission -ne 'none' -and $DefaultRepositoryPermission -ne '') {
+        $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasBaseRole' -StartId $orgMembersId -EndId ([Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("${OrgId}_all_repo_${DefaultRepositoryPermission}"))) -Properties @{traversable=$true}))
+    }
+
+    # Assign users to roles based on UserRoleMap
+    foreach ($userId in $UserRoleMap.Keys) {
+        $userRole = $UserRoleMap[$userId]
         $destId = if ($userRole -eq 'ADMIN') { $orgOwnersId } else { $orgMembersId }
-        $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasRole' -StartId $user.id -EndId $destId -Properties @{traversable=$true}))
+        $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasRole' -StartId $userId -EndId $destId -Properties @{traversable=$true}))
+    }
+
+    # Fetch custom org roles via REST
+    try {
+        $customRoles = (Invoke-GitHubRest -Session $Session -Path "orgs/$OrgLogin/organization-roles").roles
+        foreach ($customrole in $customRoles) {
+            $customRoleId = [Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("${OrgId}_$($customrole.name)"))
+            $customRoleProps = [pscustomobject]@{
+                id = Normalize-Null $customRoleId
+                name = Normalize-Null "$OrgLogin/$($customrole.name)"
+                organization_name = Normalize-Null $OrgLogin
+                organization_id = Normalize-Null $OrgId
+                short_name = Normalize-Null $customrole.name
+                type = Normalize-Null 'custom'
+                query_explicit_members = "MATCH p=(:GHUser)-[:GHHasRole]->(:GHOrgRole {id:'$($customRoleId)'}) RETURN p"
+                query_unrolled_members = "MATCH p=(:GHUser)-[:GHHasRole|GHHasBaseRole|GHMemberOf*1..]->(:GHOrgRole {id:'$($customRoleId)'}) RETURN p"
+                query_repositories = "MATCH p=(:GHOrgRole {id:'$($customRoleId)'})-[*]->(:GHRepository) RETURN p"
+            }
+            $null = $nodes.Add((New-GitHoundNode -Id $customRoleId -Kind 'GHOrgRole', 'GHRole' -Properties $customRoleProps))
+
+            # Fetch teams assigned to this custom role
+            try {
+                foreach ($team in (Invoke-GitHubRest -Session $Session -Path "orgs/$OrgLogin/organization-roles/$($customrole.id)/teams")) {
+                    $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasRole' -StartId $team.node_id -EndId $customRoleId -Properties @{traversable=$true}))
+                }
+            } catch { }
+
+            # Fetch users assigned to this custom role
+            try {
+                foreach ($user in (Invoke-GitHubRest -Session $Session -Path "orgs/$OrgLogin/organization-roles/$($customrole.id)/users")) {
+                    $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasRole' -StartId $user.node_id -EndId $customRoleId -Properties @{traversable=$true}))
+                }
+            } catch { }
+
+            # Map base_role to GHHasBaseRole edge
+            if ($null -ne $customrole.base_role) {
+                switch ($customrole.base_role) {
+                    'read' { $baseId = $orgAllRepoReadId }
+                    'triage' { $baseId = $orgAllRepoTriageId }
+                    'write' { $baseId = $orgAllRepoWriteId }
+                    'maintain' { $baseId = $orgAllRepoMaintainId }
+                    'admin' { $baseId = $orgAllRepoAdminId }
+                }
+                $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasBaseRole' -StartId $customRoleId -EndId $baseId -Properties @{traversable=$true}))
+            }
+
+            # Map permissions to edge kinds
+            foreach ($permission in $customrole.permissions) {
+                switch ($permission) {
+                    'manage_organization_webhooks' { $null = $edges.Add((New-GitHoundEdge -Kind 'GHManageOrganizationWebhooks' -StartId $customRoleId -EndId $OrgId -Properties @{traversable=$false})) }
+                    'org_bypass_code_scanning_dismissal_requests' { $null = $edges.Add((New-GitHoundEdge -Kind 'GHOrgBypassCodeScanningDismissalRequests' -StartId $customRoleId -EndId $OrgId -Properties @{traversable=$false})) }
+                    'org_bypass_secret_scanning_closure_requests' { $null = $edges.Add((New-GitHoundEdge -Kind 'GHOrgBypassSecretScanningClosureRequests' -StartId $customRoleId -EndId $OrgId -Properties @{traversable=$false})) }
+                    'org_review_and_manage_secret_scanning_bypass_requests' { $null = $edges.Add((New-GitHoundEdge -Kind 'GHOrgReviewAndManageSecretScanningBypassRequests' -StartId $customRoleId -EndId $OrgId -Properties @{traversable=$false})) }
+                    'org_review_and_manage_secret_scanning_closure_requests' { $null = $edges.Add((New-GitHoundEdge -Kind 'GHOrgReviewAndManageSecretScanningClosureRequests' -StartId $customRoleId -EndId $OrgId -Properties @{traversable=$false})) }
+                    'read_organization_actions_usage_metrics' { $null = $edges.Add((New-GitHoundEdge -Kind 'GHReadOrganizationActionsUsageMetrics' -StartId $customRoleId -EndId $OrgId -Properties @{traversable=$false})) }
+                    'read_organization_custom_org_role' { $null = $edges.Add((New-GitHoundEdge -Kind 'GHReadOrganizationCustomOrgRole' -StartId $customRoleId -EndId $OrgId -Properties @{traversable=$false})) }
+                    'read_organization_custom_repo_role' { $null = $edges.Add((New-GitHoundEdge -Kind 'GHReadOrganizationCustomRepoRole' -StartId $customRoleId -EndId $OrgId -Properties @{traversable=$false})) }
+                    'resolve_secret_scanning_alerts' { $null = $edges.Add((New-GitHoundEdge -Kind 'GHResolveSecretScanningAlerts' -StartId $customRoleId -EndId $OrgId -Properties @{traversable=$false})) }
+                    'view_secret_scanning_alerts' { $null = $edges.Add((New-GitHoundEdge -Kind 'GHViewSecretScanningAlerts' -StartId $customRoleId -EndId $OrgId -Properties @{traversable=$false})) }
+                    'write_organization_actions_secrets' { $null = $edges.Add((New-GitHoundEdge -Kind 'GHWriteOrganizationActionsSecrets' -StartId $customRoleId -EndId $OrgId -Properties @{traversable=$false})) }
+                    'write_organization_actions_settings' { $null = $edges.Add((New-GitHoundEdge -Kind 'GHWriteOrganizationActionsSettings' -StartId $customRoleId -EndId $OrgId -Properties @{traversable=$false})) }
+                    'write_organization_custom_org_role' { $null = $edges.Add((New-GitHoundEdge -Kind 'GHWriteOrganizationCustomOrgRole' -StartId $customRoleId -EndId $OrgId -Properties @{traversable=$false})) }
+                    'write_organization_custom_repo_role' { $null = $edges.Add((New-GitHoundEdge -Kind 'GHWriteOrganizationCustomRepoRole' -StartId $customRoleId -EndId $OrgId -Properties @{traversable=$false})) }
+                    'write_organization_network_configurations' { $null = $edges.Add((New-GitHoundEdge -Kind 'GHWriteOrganizationNetworkConfigurations' -StartId $customRoleId -EndId $OrgId -Properties @{traversable=$false})) }
+                }
+            }
+        }
+    } catch {
+        Write-Warning "Could not fetch custom organization roles: $_"
     }
 
     [PSCustomObject]@{
@@ -2958,6 +3116,14 @@ function Get-GraphQLRepoRoles {
     $orgAllRepoMaintainId = [Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("${OrgId}_all_repo_maintain"))
     $orgAllRepoAdminId = [Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("${OrgId}_all_repo_admin"))
 
+    # Fetch custom repo roles
+    $customRepoRoles = @()
+    try {
+        $customRepoRoles = (Invoke-GitHubRest -Session $Session -Path "orgs/$OrgLogin/custom-repository-roles").custom_roles
+    } catch {
+        Write-Warning "Could not fetch custom repository roles: $_"
+    }
+
     $totalRepos = $Repositories.Count
     $processedRepos = 0
 
@@ -2984,6 +3150,9 @@ function Get-GraphQLRepoRoles {
             repository_id = $repoId
             short_name = 'read'
             type = 'default'
+            query_explicit_members = "MATCH p=(:GHUser)-[:GHHasRole]->(:GHRepoRole {id:'$($repoReadId)'}) RETURN p"
+            query_unrolled_members = "MATCH p=(:GHUser)-[:GHHasRole|GHHasBaseRole|GHMemberOf*1..]->(:GHRepoRole {id:'$($repoReadId)'}) RETURN p"
+            query_repository = "MATCH p=(:GHRepoRole {id:'$($repoReadId)'})-[*]->(:GHRepository) RETURN p"
         }
         $null = $nodes.Add((New-GitHoundNode -Id $repoReadId -Kind 'GHRepoRole', 'GHRole' -Properties $readProps))
         $null = $edges.Add((New-GitHoundEdge -Kind 'GHReadRepoContents' -StartId $repoReadId -EndId $repoId -Properties @{traversable=$false}))
@@ -2999,6 +3168,9 @@ function Get-GraphQLRepoRoles {
             repository_id = $repoId
             short_name = 'write'
             type = 'default'
+            query_explicit_members = "MATCH p=(:GHUser)-[:GHHasRole]->(:GHRepoRole {id:'$($repoWriteId)'}) RETURN p"
+            query_unrolled_members = "MATCH p=(:GHUser)-[:GHHasRole|GHHasBaseRole|GHMemberOf*1..]->(:GHRepoRole {id:'$($repoWriteId)'}) RETURN p"
+            query_repository = "MATCH p=(:GHRepoRole {id:'$($repoWriteId)'})-[*]->(:GHRepository) RETURN p"
         }
         $null = $nodes.Add((New-GitHoundNode -Id $repoWriteId -Kind 'GHRepoRole', 'GHRole' -Properties $writeProps))
         $null = $edges.Add((New-GitHoundEdge -Kind 'GHReadRepoContents' -StartId $repoWriteId -EndId $repoId -Properties @{traversable=$false}))
@@ -3016,6 +3188,9 @@ function Get-GraphQLRepoRoles {
             repository_id = $repoId
             short_name = 'admin'
             type = 'default'
+            query_explicit_members = "MATCH p=(:GHUser)-[:GHHasRole]->(:GHRepoRole {id:'$($repoAdminId)'}) RETURN p"
+            query_unrolled_members = "MATCH p=(:GHUser)-[:GHHasRole|GHHasBaseRole|GHMemberOf*1..]->(:GHRepoRole {id:'$($repoAdminId)'}) RETURN p"
+            query_repository = "MATCH p=(:GHRepoRole {id:'$($repoAdminId)'})-[*]->(:GHRepository) RETURN p"
         }
         $null = $nodes.Add((New-GitHoundNode -Id $repoAdminId -Kind 'GHRepoRole', 'GHRole' -Properties $adminProps))
         $null = $edges.Add((New-GitHoundEdge -Kind 'GHAdminTo' -StartId $repoAdminId -EndId $repoId -Properties @{traversable=$false}))
@@ -3024,8 +3199,17 @@ function Get-GraphQLRepoRoles {
         $null = $edges.Add((New-GitHoundEdge -Kind 'GHWriteRepoPullRequests' -StartId $repoAdminId -EndId $repoId -Properties @{traversable=$false}))
         $null = $edges.Add((New-GitHoundEdge -Kind 'GHManageWebhooks' -StartId $repoAdminId -EndId $repoId -Properties @{traversable=$false}))
         $null = $edges.Add((New-GitHoundEdge -Kind 'GHManageDeployKeys' -StartId $repoAdminId -EndId $repoId -Properties @{traversable=$false}))
+        $null = $edges.Add((New-GitHoundEdge -Kind 'GHPushProtectedBranch' -StartId $repoAdminId -EndId $repoId -Properties @{traversable=$false}))
+        $null = $edges.Add((New-GitHoundEdge -Kind 'GHDeleteAlertsCodeScanning' -StartId $repoAdminId -EndId $repoId -Properties @{traversable=$false}))
+        $null = $edges.Add((New-GitHoundEdge -Kind 'GHViewSecretScanningAlerts' -StartId $repoAdminId -EndId $repoId -Properties @{traversable=$false}))
+        $null = $edges.Add((New-GitHoundEdge -Kind 'GHRunOrgMigration' -StartId $repoAdminId -EndId $repoId -Properties @{traversable=$false}))
         $null = $edges.Add((New-GitHoundEdge -Kind 'GHBypassBranchProtection' -StartId $repoAdminId -EndId $repoId -Properties @{traversable=$false}))
+        $null = $edges.Add((New-GitHoundEdge -Kind 'GHManageSecurityProducts' -StartId $repoAdminId -EndId $repoId -Properties @{traversable=$false}))
+        $null = $edges.Add((New-GitHoundEdge -Kind 'GHManageRepoSecurityProducts' -StartId $repoAdminId -EndId $repoId -Properties @{traversable=$false}))
         $null = $edges.Add((New-GitHoundEdge -Kind 'GHEditRepoProtections' -StartId $repoAdminId -EndId $repoId -Properties @{traversable=$false}))
+        $null = $edges.Add((New-GitHoundEdge -Kind 'GHJumpMergeQueue' -StartId $repoAdminId -EndId $repoId -Properties @{traversable=$false}))
+        $null = $edges.Add((New-GitHoundEdge -Kind 'GHCreateSoloMergeQueueEntry' -StartId $repoAdminId -EndId $repoId -Properties @{traversable=$false}))
+        $null = $edges.Add((New-GitHoundEdge -Kind 'GHEditRepoCustomPropertiesValue' -StartId $repoAdminId -EndId $repoId -Properties @{traversable=$false}))
         $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasBaseRole' -StartId $orgAllRepoAdminId -EndId $repoAdminId -Properties @{traversable=$true}))
 
         # Triage role
@@ -3038,6 +3222,9 @@ function Get-GraphQLRepoRoles {
             repository_id = $repoId
             short_name = 'triage'
             type = 'default'
+            query_explicit_members = "MATCH p=(:GHUser)-[:GHHasRole]->(:GHRepoRole {id:'$($repoTriageId)'}) RETURN p"
+            query_unrolled_members = "MATCH p=(:GHUser)-[:GHHasRole|GHHasBaseRole|GHMemberOf*1..]->(:GHRepoRole {id:'$($repoTriageId)'}) RETURN p"
+            query_repository = "MATCH p=(:GHRepoRole {id:'$($repoTriageId)'})-[*]->(:GHRepository) RETURN p"
         }
         $null = $nodes.Add((New-GitHoundNode -Id $repoTriageId -Kind 'GHRepoRole', 'GHRole' -Properties $triageProps))
         $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasBaseRole' -StartId $repoTriageId -EndId $repoReadId -Properties @{traversable=$true}))
@@ -3053,11 +3240,42 @@ function Get-GraphQLRepoRoles {
             repository_id = $repoId
             short_name = 'maintain'
             type = 'default'
+            query_explicit_members = "MATCH p=(:GHUser)-[:GHHasRole]->(:GHRepoRole {id:'$($repoMaintainId)'}) RETURN p"
+            query_unrolled_members = "MATCH p=(:GHUser)-[:GHHasRole|GHHasBaseRole|GHMemberOf*1..]->(:GHRepoRole {id:'$($repoMaintainId)'}) RETURN p"
+            query_repository = "MATCH p=(:GHRepoRole {id:'$($repoMaintainId)'})-[*]->(:GHRepository) RETURN p"
         }
         $null = $nodes.Add((New-GitHoundNode -Id $repoMaintainId -Kind 'GHRepoRole', 'GHRole' -Properties $maintainProps))
         $null = $edges.Add((New-GitHoundEdge -Kind 'GHPushProtectedBranch' -StartId $repoMaintainId -EndId $repoId -Properties @{traversable=$false}))
         $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasBaseRole' -StartId $repoMaintainId -EndId $repoWriteId -Properties @{traversable=$true}))
         $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasBaseRole' -StartId $orgAllRepoMaintainId -EndId $repoMaintainId -Properties @{traversable=$true}))
+
+        # Custom Repository Roles
+        foreach ($customRepoRole in $customRepoRoles) {
+            $customRepoRoleId = [Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("${repoId}_$($customRepoRole.name)"))
+            $customRepoRoleProps = [pscustomobject]@{
+                id = Normalize-Null $customRepoRoleId
+                name = Normalize-Null "$repoFullName/$($customRepoRole.name)"
+                organization_name = Normalize-Null $OrgLogin
+                organization_id = Normalize-Null $OrgId
+                repository_name = Normalize-Null $repoName
+                repository_id = Normalize-Null $repoId
+                short_name = Normalize-Null $customRepoRole.name
+                type = Normalize-Null 'custom'
+                query_explicit_members = "MATCH p=(:GHUser)-[:GHHasRole]->(:GHRepoRole {id:'$($customRepoRoleId)'}) RETURN p"
+                query_unrolled_members = "MATCH p=(:GHUser)-[:GHHasRole|GHHasBaseRole|GHMemberOf*1..]->(:GHRepoRole {id:'$($customRepoRoleId)'}) RETURN p"
+                query_repository = "MATCH p=(:GHRepoRole {id:'$($customRepoRoleId)'})-[*]->(:GHRepository) RETURN p"
+            }
+            $null = $nodes.Add((New-GitHoundNode -Id $customRepoRoleId -Kind 'GHRepoRole', 'GHRole' -Properties $customRepoRoleProps))
+
+            if ($null -ne $customRepoRole.base_role) {
+                $targetBaseRoleId = [Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("${repoId}_$($customRepoRole.base_role)"))
+                $null = $edges.Add((New-GitHoundEdge -Kind 'GHHasBaseRole' -StartId $customRepoRoleId -EndId $targetBaseRoleId -Properties @{traversable=$true}))
+            }
+
+            foreach ($permission in $customRepoRole.permissions) {
+                $null = $edges.Add((New-GitHoundEdge -Kind "GH$(ConvertTo-PascalCase -String $permission)" -StartId $customRepoRoleId -EndId $repoId -Properties @{traversable=$false}))
+            }
+        }
 
         if ($processedRepos % 50 -eq 0) {
             Write-Host "[*] reporoles: Processed $processedRepos/$totalRepos repositories..."
@@ -3104,12 +3322,26 @@ function Get-GraphQLSAML {
 
         # Add SAML provider node (only on first iteration)
         if ($cursor -eq $null) {
-            # Determine IdP type
+            # Determine IdP type and foreign environment ID
             $ForeignUserNodeKind = 'ExternalUser'
+            $ForeginEnvironmentNodeKind = 'ExternalEnvironment'
+            $ForeignEnvironmentId = ''
             switch -Wildcard ($samlProvider.issuer) {
-                'https://auth.pingone.com/*' { $ForeignUserNodeKind = 'PingOneUser' }
-                'https://sts.windows.net/*' { $ForeignUserNodeKind = 'AZUser' }
-                'http://www.okta.com/*' { $ForeignUserNodeKind = 'OktaUser' }
+                'https://auth.pingone.com/*' {
+                    $ForeignUserNodeKind = 'PingOneUser'
+                    $ForeginEnvironmentNodeKind = 'PingOneOrganization'
+                    $ForeignEnvironmentId = $samlProvider.issuer.Split('/')[3]
+                }
+                'https://sts.windows.net/*' {
+                    $ForeignUserNodeKind = 'AZUser'
+                    $ForeginEnvironmentNodeKind = 'AZTenant'
+                    $ForeignEnvironmentId = $samlProvider.issuer.Split('/')[3]
+                }
+                'http://www.okta.com/*' {
+                    $ForeignUserNodeKind = 'OktaUser'
+                    $ForeginEnvironmentNodeKind = 'OktaOrganization'
+                    $ForeignEnvironmentId = $samlProvider.ssoUrl.Split('/')[2]
+                }
             }
 
             $providerProps = [pscustomobject]@{
@@ -3117,10 +3349,14 @@ function Get-GraphQLSAML {
                 node_id = $samlProvider.id
                 organization_name = $result.data.organization.name
                 organization_id = $result.data.organization.id
+                foreign_environment_id = $ForeignEnvironmentId
                 digest_method = Normalize-Null $samlProvider.digestMethod
+                idp_certificate = Normalize-Null $samlProvider.idpCertificate
                 signature_method = Normalize-Null $samlProvider.signatureMethod
                 sso_url = Normalize-Null $samlProvider.ssoUrl
                 issuer = Normalize-Null $samlProvider.issuer
+                query_environments = "MATCH p=(:GHSamlIdentityProvider {objectid: '$($samlProvider.id.ToUpper())'})<-[:GHHasSamlIdentityProvider]->(:GHOrganization) RETURN p"
+                query_external_identities = "MATCH p=(:GHSamlIdentityProvider {objectid: '$($samlProvider.id.ToUpper())'})-[:GHHasExternalIdentity]->() RETURN p"
             }
 
             $null = $nodes.Add((New-GitHoundNode -Id $samlProvider.id -Kind 'GHSamlIdentityProvider' -Properties $providerProps))
@@ -3131,6 +3367,7 @@ function Get-GraphQLSAML {
         foreach ($identity in $samlProvider.externalIdentities.nodes) {
             $identityProps = [pscustomobject]@{
                 name = Normalize-Null $identity.id
+                guid = Normalize-Null $identity.guid
                 organization_id = $result.data.organization.id
                 organization_name = $result.data.organization.name
                 saml_identity_family_name = Normalize-Null $identity.samlIdentity.familyName
@@ -3142,6 +3379,7 @@ function Get-GraphQLSAML {
                 scim_identity_username = Normalize-Null $identity.scimIdentity.username
                 github_username = Normalize-Null $identity.user.login
                 github_user_id = Normalize-Null $identity.user.id
+                query_mapped_users = "MATCH p=(:GHExternalIdentity {objectid: '$($identity.id.ToUpper())'})-[:GHMapsToUser]->() RETURN p"
             }
 
             $null = $nodes.Add((New-GitHoundNode -Id $identity.id -Kind 'GHExternalIdentity' -Properties $identityProps))
@@ -3155,7 +3393,7 @@ function Get-GraphQLSAML {
             if ($identity.user.id) {
                 $null = $edges.Add((New-GitHoundEdge -Kind 'GHMapsToUser' -StartId $identity.id -EndId $identity.user.id -Properties @{traversable=$false}))
                 if ($username) {
-                    $null = $edges.Add((New-GitHoundEdge -Kind 'SyncedToGHUser' -StartId $username -StartKind $ForeignUserNodeKind -StartMatchBy 'name' -EndId $identity.user.id -Properties @{traversable=$true}))
+                    $null = $edges.Add((New-GitHoundEdge -Kind 'SyncedToGHUser' -StartId $username -StartKind $ForeignUserNodeKind -StartMatchBy 'name' -EndId $identity.user.id -Properties @{traversable=$true; composition="MATCH p=()<-[:GHSyncedToEnvironment]-(:GHSamlIdentityProvider)-[:GHHasExternalIdentity]->(:GHExternalIdentity)-[:GHMapsToUser]->(n) WHERE n.objectid = '$($identity.user.id.ToUpper())' OR n.name = '$($identity.samlIdentity.username.ToUpper())' RETURN p"}))
                 }
             }
         }
@@ -3343,6 +3581,7 @@ function Invoke-GitHoundGraphQL {
     $org = Get-GraphQLOrganization -Session $Session
     $orgId = $org.OrgId
     $orgLogin = $org.OrgLogin
+    $defaultRepositoryPermission = if ($org.DefaultRepositoryPermission) { $org.DefaultRepositoryPermission } else { 'none' }
     Stop-GitHoundPhaseMetrics -PhaseName 'organization'
 
     # Setup output folder
@@ -3386,7 +3625,8 @@ function Invoke-GitHoundGraphQL {
     }
     $null = $allNodes.AddRange(@($org.Nodes))
 
-    # Store users for OrgRoles phase
+    # Store user role mapping for OrgRoles phase
+    $collectedUserRoleMap = @{}
     $collectedUsers = @()
     $collectedRepos = @()
 
@@ -3406,6 +3646,7 @@ function Invoke-GitHoundGraphQL {
 
             $null = $allNodes.AddRange(@($users.Nodes))
             $collectedUsers = @($users.Nodes)
+            if ($users.UserRoleMap) { $collectedUserRoleMap = $users.UserRoleMap }
 
             Stop-GitHoundPhaseMetrics -PhaseName 'users'
             $completedPhases += 'users'
@@ -3647,12 +3888,23 @@ function Invoke-GitHoundGraphQL {
     # ===========================================
     # OrgRoles Phase
     # ===========================================
-    if ($Collect -contains 'OrgRoles' -and $collectedUsers.Count -gt 0) {
+    if ($Collect -contains 'OrgRoles' -and ($collectedUserRoleMap.Count -gt 0 -or $collectedUsers.Count -gt 0)) {
         if ($completedPhases -notcontains 'orgroles') {
             Start-GitHoundPhaseMetrics -PhaseName 'orgroles'
             Write-Host "[*] Creating Organization Role Nodes"
 
-            $orgRoles = Get-GraphQLOrgRoles -Session $Session -OrgLogin $orgLogin -OrgId $orgId -Users $collectedUsers
+            # If UserRoleMap is empty (e.g. on resume), rebuild from REST
+            if ($collectedUserRoleMap.Count -eq 0 -and $collectedUsers.Count -gt 0) {
+                Write-Host "[*] Rebuilding user role mapping from REST API..."
+                $restMembers = Invoke-GitHubRest -Session $Session -Path "orgs/$orgLogin/members?per_page=100&role=admin"
+                $adminNodeIds = @{}
+                foreach ($m in $restMembers) { $adminNodeIds[$m.node_id] = $true }
+                foreach ($u in $collectedUsers) {
+                    $collectedUserRoleMap[$u.id] = if ($adminNodeIds.ContainsKey($u.id)) { 'ADMIN' } else { 'MEMBER' }
+                }
+            }
+
+            $orgRoles = Get-GraphQLOrgRoles -Session $Session -OrgLogin $orgLogin -OrgId $orgId -UserRoleMap $collectedUserRoleMap -DefaultRepositoryPermission $defaultRepositoryPermission
 
             $orFile = Write-GitHoundPayload -OutputPath $outputFolder -OrgName $orgId -PhaseName 'OrgRole' -Tier 3 -Nodes $orgRoles.Nodes -Edges $orgRoles.Edges
             $null = $writtenFiles.Add(@{ File = $orFile; Tier = 3; Phase = 'orgroles' })
